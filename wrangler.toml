@@ -26,3 +26,6 @@ MIN_EVENT_MAGNITUDE = "3"
 MIN_INTENSITY_TO_SHOW = "3"
 ALERTA_TOP = "10"
 ALERTA_CANAL = "sms"
+
+[observability.logs]
+enabled = true
