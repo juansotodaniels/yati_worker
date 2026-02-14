@@ -330,4 +330,11 @@ async function markAlerted(env, eventId, mag) {
   await env.YATI_KV.put("last_alerted_mag", String(mag));
   await env.YATI_KV.put("last_alerted_at", new Date().toISOString());
 }
+async function safeText(resp) {
+  try {
+    return await resp.text();
+  } catch {
+    return "";
+  }
+}
 
