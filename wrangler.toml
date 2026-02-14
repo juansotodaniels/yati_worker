@@ -24,5 +24,3 @@ ENABLE_TEST_ALERT = "0"
 
 [observability.logs]
 enabled = true
-true
-
