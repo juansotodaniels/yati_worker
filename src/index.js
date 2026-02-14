@@ -203,7 +203,7 @@ async function testManualAlert(env, forceTo = "", customMsg = "") {
   const msg =
     (customMsg && customMsg.trim())
       ? customMsg.trim()
-      : "YATI - Sistema de Alerta Sismica. Prueba manual de envio SMS.";
+      : "YATI - Sistema de Alerta de Intensidad Sismica. Prueba manual de envio SMS.";
 
   const toFixed = (forceTo || "").trim();
 
@@ -254,7 +254,7 @@ function buildMessage({ evento, locs, top }) {
 
   const locPart = list ? ` Localidades con intensidad estimada: ${list}.` : "";
 
-  return `YATI - Sistema de Alerta Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}.${locPart}`;
+  return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}.${locPart}`;
 }
 
 async function twilioSms(env, to, body) {
