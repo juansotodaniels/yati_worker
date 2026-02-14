@@ -12,7 +12,7 @@ id = "28fd8f5831ea4ce3afd26bdaaa29990b"
 
 [vars]
 # Usa base URL y el worker agrega /alerta/v1
-RAILWAY_BASE_URL = "https://TU-SERVICIO.up.railway.app"
+RAILWAY_BASE_URL = "https://web-production-90ba9.up.railway.app"
 XOR_API_URL = "https://api.xor.cl/sismo/recent"
 RAILWAY_ALERTA_V1 = "https://web-production-90ba9.up.railway.app/alerta/v1"
 # Claves acceso Twilio
