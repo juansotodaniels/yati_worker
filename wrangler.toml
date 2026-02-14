@@ -8,7 +8,7 @@ crons = ["* * * * *"]
 # KV Binding (esto evita que el binding “desaparezca”)
 [[kv_namespaces]]
 binding = "YATI_KV"
-id = "YATI_STATE"
+id = "28fd8f5831ea4ce3afd26bdaaa29990b"
 
 [vars]
 # Usa base URL y el worker agrega /alerta/v1
