@@ -18,7 +18,7 @@ RAILWAY_ALERTA_V1 = "https://web-production-90ba9.up.railway.app/alerta/v1"
 # Claves acceso Twilio
 TWILIO_ACCOUNT_SID = "ACcf9e3f36ee842c4b6bcabaeb5aee188d"
 TWILIO_AUTH_TOKEN = "82bdff6dcae50f9dc88bd30672b50518"
-TWILIO_FROM_NUMBER =+16079004736"
+TWILIO_FROM_NUMBER ="+16079004736"
 # Config general
 MIN_EVENT_MAGNITUDE = "3"
 MIN_INTENSITY_TO_SHOW = "3"
