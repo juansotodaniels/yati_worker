@@ -6,15 +6,12 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Health
     if (url.pathname === "/") {
       return new Response("YATI Worker activo");
     }
 
-    // 🔒 TEST ALERT (protegido por ENABLE_TEST_ALERT)
     if (url.pathname === "/test-alert") {
 
-      // Si no está habilitado → 404 como si no existiera
       if (env.ENABLE_TEST_ALERT !== "1") {
         return new Response("Not Found", { status: 404 });
       }
@@ -32,7 +29,6 @@ export default {
       return new Response("OK - test alert triggered");
     }
 
-    // TwiML para llamadas
     if (url.pathname === "/twiml") {
       const text = url.searchParams.get("text") || "Alerta sismica YATI.";
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -97,10 +93,7 @@ async function checkForNewEvent(env) {
 
   const latest = events[0];
   const latestId = String(latest?.id ?? "");
-  if (!latestId) {
-    console.log("[YATI] event sin id");
-    return;
-  }
+  if (!latestId) return;
 
   const magRaw = latest?.magnitude;
   const magVal =
@@ -109,24 +102,13 @@ async function checkForNewEvent(env) {
       : (latest?.magnitud ?? latest?.mag ?? latest?.magnitude);
 
   const M = parseFloat(String(magVal).replace(",", "."));
-  if (!Number.isFinite(M)) {
-    console.log("[YATI] No pude parsear magnitud para id:", latestId);
-    return;
-  }
+  if (!Number.isFinite(M)) return;
 
   const storedId = await env.YATI_KV.get("last_alerted_event_id");
 
-  if (storedId === latestId) {
-    console.log("[YATI] Sin cambio (ya alertado):", latestId);
-    return;
-  }
+  if (storedId === latestId) return;
 
-  if (M < MIN_EVENT_MAGNITUDE) {
-    console.log(`[YATI] Nuevo id ${latestId} pero M=${M} < ${MIN_EVENT_MAGNITUDE}. No alerto.`);
-    return;
-  }
-
-  console.log(`[YATI] Nuevo sismo detectado: ${latestId} (M=${M}). Consultando Railway /alerta/v1...`);
+  if (M < MIN_EVENT_MAGNITUDE) return;
 
   let payload;
   try {
@@ -136,13 +118,10 @@ async function checkForNewEvent(env) {
     u.searchParams.set("top", String(ALERTA_TOP));
 
     const r = await fetch(u.toString(), { headers: { "User-Agent": "YATI-Worker/1.0" } });
-    if (!r.ok) {
-      console.log("[YATI] Railway /alerta/v1 no OK:", r.status);
-      return;
-    }
+    if (!r.ok) return;
+
     payload = await r.json();
-  } catch (e) {
-    console.log("[YATI] Error Railway:", String(e));
+  } catch {
     return;
   }
 
@@ -172,7 +151,12 @@ async function checkForNewEvent(env) {
     return;
   }
 
-  const message = buildMessage({ evento, locs, top: ALERTA_TOP });
+  const message = buildMessage({
+    evento,
+    locs,
+    top: ALERTA_TOP,
+    minInt: MIN_INTENSITY_TO_SHOW
+  });
 
   let okCount = 0;
 
@@ -195,54 +179,10 @@ async function checkForNewEvent(env) {
 }
 
 /* ===============================
-   TEST ALERT
-================================= */
-
-async function testManualAlert(env, forceTo = "", customMsg = "") {
-
-  const msg =
-    (customMsg && customMsg.trim())
-      ? customMsg.trim()
-      : "YATI - Sistema de Alerta de Intensidad Sismica. Prueba manual de envio SMS.";
-
-  const toFixed = (forceTo || "").trim();
-
-  if (toFixed) {
-    await twilioSms(env, toFixed, msg);
-    return;
-  }
-
-  const targets = await loadTargets(env);
-  for (const t of targets) {
-    if (t.enabled) {
-      await twilioSms(env, t.phone, msg);
-    }
-  }
-}
-
-/* ===============================
    HELPERS
 ================================= */
 
-async function loadTargets(env) {
-  try {
-    const raw = await env.YATI_KV.get("alert_targets_v1");
-    if (!raw) return [];
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) return [];
-    return arr.map(x => ({
-      user: x.user || "",
-      phone: x.phone || "",
-      min_mag: x.min_mag ?? 0,
-      localidad: x.localidad || "",
-      enabled: Boolean(x.enabled)
-    }));
-  } catch {
-    return [];
-  }
-}
-
-function buildMessage({ evento, locs, top }) {
+function buildMessage({ evento, locs, top, minInt }) {
   const mag = evento?.magnitud ?? "";
   const fecha = evento?.FechaHora ?? "";
   const ref = evento?.Referencia ?? "";
@@ -252,89 +192,9 @@ function buildMessage({ evento, locs, top }) {
     .map(x => `${x.localidad}(I=${x.intensidad_predicha})`)
     .join(", ");
 
-  const locPart = list ? ` Localidades con intensidad estimada: ${list}.` : "";
-
-  return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}.${locPart}`;
-}
-
-async function twilioSms(env, to, body) {
-  const sid = env.TWILIO_ACCOUNT_SID;
-  const token = env.TWILIO_AUTH_TOKEN;
-  const from = env.TWILIO_FROM_NUMBER;
-
-  if (!sid || !token || !from) {
-    throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM).");
+  if (!list) {
+    return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. No hay localidades con intensidad estimada sobre el umbral ${minInt}.`;
   }
 
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
-
-  const form = new URLSearchParams();
-  form.set("To", String(to).trim());
-  form.set("From", String(from).trim());
-  form.set("Body", String(body));
-
-  const auth = btoa(`${sid}:${token}`);
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: form.toString()
-  });
-
-  const txt = await safeText(r);
-
-  if (!r.ok) {
-    // Twilio devuelve JSON con code/message normalmente
-    throw new Error(`Twilio SMS no OK: ${r.status} ${txt?.slice(0, 300)}`);
-  }
-
-  return txt;
+  return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. Localidades con intensidad estimada: ${list}.`;
 }
-
-
-async function twilioCall(env, to, text) {
-  const sid = env.TWILIO_ACCOUNT_SID;
-  const token = env.TWILIO_AUTH_TOKEN;
-  const from = env.TWILIO_FROM_NUMBER;
-  const base = env.WORKER_PUBLIC_URL;
-
-  const twimlUrl = new URL(base.replace(/\/$/, "") + "/twiml");
-  twimlUrl.searchParams.set("text", text);
-
-  const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Calls.json`;
-
-  const form = new URLSearchParams();
-  form.set("To", to);
-  form.set("From", from);
-  form.set("Url", twimlUrl.toString());
-
-  const auth = btoa(`${sid}:${token}`);
-
-  const r = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Basic ${auth}`,
-      "Content-Type": "application/x-www-form-urlencoded"
-    },
-    body: form.toString()
-  });
-
-  if (!r.ok) throw new Error("Twilio CALL error");
-}
-
-async function markAlerted(env, eventId, mag) {
-  await env.YATI_KV.put("last_alerted_event_id", String(eventId));
-  await env.YATI_KV.put("last_alerted_mag", String(mag));
-  await env.YATI_KV.put("last_alerted_at", new Date().toISOString());
-}
-async function safeText(resp) {
-  try {
-    return await resp.text();
-  } catch {
-    return "";
-  }
-}
-
