@@ -6,15 +6,28 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
-    // Endpoint simple para health
+    // Health
     if (url.pathname === "/") {
       return new Response("YATI Worker activo");
     }
 
-    // TwiML para llamadas (si usas canal=call)
-    // Twilio llamará a esta URL para saber qué decir.
+    // Disparo manual de prueba: /test-alert?pin=123456&to=%2B569...&msg=...
+    if (url.pathname === "/test-alert") {
+      const pin = url.searchParams.get("pin") || "";
+      if (!env.TEST_ALERT_PIN || pin !== env.TEST_ALERT_PIN) {
+        return new Response("Forbidden", { status: 403 });
+      }
+
+      const to = url.searchParams.get("to") || env.TEST_ALERT_TO || "";
+      const customMsg = url.searchParams.get("msg") || "";
+
+      ctx.waitUntil(testManualAlert(env, to, customMsg));
+      return new Response("OK - test alert triggered");
+    }
+
+    // TwiML para llamadas (si en el futuro usas ALERTA_CANAL=call)
     if (url.pathname === "/twiml") {
-      const text = url.searchParams.get("text") || "Alerta sísmica YATI.";
+      const text = url.searchParams.get("text") || "Alerta sismica YATI.";
       const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say language="es-CL" voice="alice">${escapeXml(text)}</Say>
@@ -39,16 +52,17 @@ function escapeXml(s) {
 
 async function checkForNewEvent(env) {
   const XOR_URL = env.XOR_API_URL || "https://api.xor.cl/sismo/recent";
-  const RAILWAY_ALERTA_V1 = env.RAILWAY_ALERTA_V1;
+  const RAILWAY_BASE_URL = env.RAILWAY_BASE_URL;
 
+  // Config general (Worker)
   const MIN_EVENT_MAGNITUDE = parseFloat(env.MIN_EVENT_MAGNITUDE || "4");
   const MIN_INTENSITY_TO_SHOW = parseInt(env.MIN_INTENSITY_TO_SHOW || "3", 10);
-  const ALERTA_TOP = parseInt(env.ALERTA_TOP || "50", 10);
+  const ALERTA_TOP = parseInt(env.ALERTA_TOP || "10", 10);
 
   const CANAL = (env.ALERTA_CANAL || "sms").toLowerCase(); // "sms" o "call"
 
-  if (!RAILWAY_ALERTA_V1) {
-    console.log("[YATI] Falta env.RAILWAY_ALERTA_V1");
+  if (!RAILWAY_BASE_URL) {
+    console.log("[YATI] Falta env.RAILWAY_BASE_URL");
     return;
   }
 
@@ -79,6 +93,7 @@ async function checkForNewEvent(env) {
     return;
   }
 
+  // Magnitud robusta: puede venir como number, string o {value:...}
   const magRaw = latest?.magnitude;
   const magVal =
     typeof magRaw === "object" && magRaw !== null
@@ -91,24 +106,28 @@ async function checkForNewEvent(env) {
     return;
   }
 
+  // Guardamos el último id alertado (no solo visto), para evitar llamadas repetidas
   const storedId = await env.YATI_KV.get("last_alerted_event_id");
+
+  // Si ya alertamos este id, no hacemos nada
   if (storedId === latestId) {
     console.log("[YATI] Sin cambio (ya alertado):", latestId);
     return;
   }
 
+  // Si es nuevo PERO no cumple magnitud mínima, NO alertamos ni guardamos
   if (M < MIN_EVENT_MAGNITUDE) {
     console.log(`[YATI] Nuevo id ${latestId} pero M=${M} < ${MIN_EVENT_MAGNITUDE}. No alerto.`);
     return;
   }
 
+  // --- 2) Traer payload desde Railway (evento + intensidades) ---
   console.log(`[YATI] Nuevo sismo detectado: ${latestId} (M=${M}). Consultando Railway /alerta/v1...`);
 
-  // --- 2) Traer payload desde Railway (evento + intensidades) ---
   let payload;
   try {
-    const u = new URL(RAILWAY_ALERTA_V1);
-    u.searchParams.set("min_mag", String(MIN_EVENT_MAGNITUDE));  // umbral general
+    const u = new URL(RAILWAY_BASE_URL.replace(/\/$/, "") + "/alerta/v1");
+    u.searchParams.set("min_mag", String(MIN_EVENT_MAGNITUDE));
     u.searchParams.set("min_int", String(MIN_INTENSITY_TO_SHOW));
     u.searchParams.set("top", String(ALERTA_TOP));
 
@@ -124,10 +143,6 @@ async function checkForNewEvent(env) {
   }
 
   const evento = payload?.evento || {};
-  const evId = String(evento?.id || "") || latestId; // fallback al id XOR
-  const evUid = String(evento?.event_uid || "");
-  const ref = String(evento?.Referencia || "");
-  const fecha = String(evento?.FechaHora || "");
   const mag = Number(evento?.magnitud ?? M);
 
   const locs = Array.isArray(payload?.localidades) ? payload.localidades : [];
@@ -143,6 +158,7 @@ async function checkForNewEvent(env) {
   // --- 4) Filtrar targets según reglas ---
   const selected = targets.filter(t => {
     if (!t.enabled) return false;
+
     const minMagUser = Number(t.min_mag ?? 0);
     if (mag < minMagUser) return false;
 
@@ -154,17 +170,17 @@ async function checkForNewEvent(env) {
 
   if (!selected.length) {
     console.log("[YATI] Evento nuevo pero no hay targets que calcen reglas. No envío.");
-    // OJO: igual marcamos alertado para no repetir cada minuto si no hay destinatarios
+    // Marcamos alertado para no repetir cada minuto si no hay destinatarios aplicables
     await markAlerted(env, latestId, mag);
     return;
   }
 
-  // --- 5) Armar mensaje ---
+  // --- 5) Armar mensaje (Institucional, sin ID) ---
   const message = buildMessage({ evento, locs, top: ALERTA_TOP });
 
+  // --- 6) Enviar por Twilio ---
   console.log(`[YATI] Enviando alerta a ${selected.length} targets via ${CANAL}...`);
 
-  // --- 6) Enviar por Twilio ---
   let okCount = 0;
   for (const t of selected) {
     const to = String(t.phone || "").trim();
@@ -185,21 +201,63 @@ async function checkForNewEvent(env) {
   // --- 7) Solo si enviamos al menos 1, marcamos como alertado ---
   if (okCount > 0) {
     await markAlerted(env, latestId, mag);
-    await env.YATI_KV.put("last_alerted_payload_id", evId);
-    await env.YATI_KV.put("last_alerted_event_uid", evUid);
     console.log("[YATI] OK enviados:", okCount, "event_id:", latestId);
   } else {
     console.log("[YATI] No se pudo enviar a nadie (okCount=0). No marco alertado.");
   }
 }
 
+// ---- TEST ALERT (manual) ----
+async function testManualAlert(env, forceTo = "", customMsg = "") {
+  const msg =
+    (customMsg && customMsg.trim())
+      ? customMsg.trim()
+      : "YATI - Sistema de Alerta Sismica. Prueba manual de envio SMS (Twilio).";
+
+  // Si se define TEST_ALERT_TO (o query param to=), mandamos solo a ese numero
+  const toFixed = (forceTo || "").trim();
+
+  if (toFixed) {
+    try {
+      await twilioSms(env, toFixed, msg);
+      console.log("[TEST] Enviado a (forceTo):", toFixed);
+    } catch (e) {
+      console.log("[TEST] Error enviando a (forceTo):", toFixed, String(e));
+    }
+    return;
+  }
+
+  // Si no, enviamos a todos los targets habilitados
+  const targets = await loadTargets(env);
+  if (!targets.length) {
+    console.log("[TEST] No hay targets en KV (alert_targets_v1)");
+    return;
+  }
+
+  let sent = 0;
+  for (const t of targets) {
+    if (!t.enabled) continue;
+    const to = String(t.phone || "").trim();
+    if (!to) continue;
+
+    try {
+      await twilioSms(env, to, msg);
+      console.log("[TEST] Enviado a:", to);
+      sent++;
+    } catch (e) {
+      console.log("[TEST] Error enviando a:", to, String(e));
+    }
+  }
+  console.log("[TEST] Total enviados:", sent);
+}
+
+// ---- TARGETS desde KV ----
 async function loadTargets(env) {
   try {
     const raw = await env.YATI_KV.get("alert_targets_v1");
     if (!raw) return [];
     const arr = JSON.parse(raw);
     if (!Array.isArray(arr)) return [];
-    // normalización mínima
     return arr.map(x => ({
       user: x.user || "",
       phone: x.phone || "",
@@ -213,6 +271,7 @@ async function loadTargets(env) {
   }
 }
 
+// ---- MENSAJE (Institucional, sin ID, ASCII-friendly) ----
 function buildMessage({ evento, locs, top }) {
   const mag = evento?.magnitud ?? "";
   const fecha = evento?.FechaHora ?? "";
@@ -225,10 +284,10 @@ function buildMessage({ evento, locs, top }) {
 
   const locPart = list ? ` Localidades con intensidad estimada: ${list}.` : "";
 
-  return `YATI - Sistema de predicción de intensidad sísmica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}.${locPart}`;
+  return `YATI - Sistema de Alerta Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}.${locPart}`;
 }
 
-
+// ---- TWILIO SMS ----
 async function twilioSms(env, to, body) {
   const sid = env.TWILIO_ACCOUNT_SID;
   const token = env.TWILIO_AUTH_TOKEN;
@@ -257,13 +316,14 @@ async function twilioSms(env, to, body) {
   if (!r.ok) throw new Error(`Twilio SMS no OK: ${r.status} ${(await safeText(r)).slice(0, 200)}`);
 }
 
+// ---- TWILIO CALL (opcional futuro) ----
 async function twilioCall(env, to, text) {
   const sid = env.TWILIO_ACCOUNT_SID;
   const token = env.TWILIO_AUTH_TOKEN;
   const from = env.TWILIO_FROM_NUMBER;
 
   if (!sid || !token || !from) throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM).");
-  if (!env.WORKER_PUBLIC_URL) throw new Error("Falta env.WORKER_PUBLIC_URL (ej: https://tu-worker.tu-dominio.workers.dev)");
+  if (!env.WORKER_PUBLIC_URL) throw new Error("Falta env.WORKER_PUBLIC_URL (ej: https://tu-worker.workers.dev)");
 
   const twimlUrl = new URL(env.WORKER_PUBLIC_URL.replace(/\/$/, "") + "/twiml");
   twimlUrl.searchParams.set("text", text);
@@ -289,6 +349,7 @@ async function twilioCall(env, to, text) {
   if (!r.ok) throw new Error(`Twilio CALL no OK: ${r.status} ${(await safeText(r)).slice(0, 200)}`);
 }
 
+// ---- KV: marcar alertado ----
 async function markAlerted(env, eventId, mag) {
   await env.YATI_KV.put("last_alerted_event_id", String(eventId));
   await env.YATI_KV.put("last_alerted_mag", String(mag));
@@ -298,3 +359,4 @@ async function markAlerted(env, eventId, mag) {
 async function safeText(resp) {
   try { return await resp.text(); } catch { return ""; }
 }
+
