@@ -1,31 +1,28 @@
-name = "yati-worker"
+name = "yatiworker"
 main = "src/index.js"
 compatibility_date = "2026-02-13"
 
 [triggers]
 crons = ["* * * * *"]
 
-# KV Binding (esto evita que el binding “desaparezca”)
 [[kv_namespaces]]
 binding = "YATI_KV"
 id = "28fd8f5831ea4ce3afd26bdaaa29990b"
 
 [vars]
-# Usa base URL y el worker agrega /alerta/v1
 RAILWAY_BASE_URL = "https://web-production-90ba9.up.railway.app"
 XOR_API_URL = "https://api.xor.cl/sismo/recent"
-RAILWAY_ALERTA_V1 = "https://web-production-90ba9.up.railway.app/alerta/v1"
-ENABLE_TEST_ALERT = "1"
-TEST_ALERT_PIN = "123456"
-TEST_ALERT_TO = "+56999394909"
 
-
-TWILIO_FROM_NUMBER ="+16079004736"
 # Config general
 MIN_EVENT_MAGNITUDE = "3"
 MIN_INTENSITY_TO_SHOW = "3"
 ALERTA_TOP = "10"
 ALERTA_CANAL = "sms"
 
+# Seguridad (apagado por defecto)
+ENABLE_TEST_ALERT = "0"
+
 [observability.logs]
 enabled = true
+true
+
