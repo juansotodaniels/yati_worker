@@ -15,9 +15,11 @@ id = "28fd8f5831ea4ce3afd26bdaaa29990b"
 RAILWAY_BASE_URL = "https://web-production-90ba9.up.railway.app"
 XOR_API_URL = "https://api.xor.cl/sismo/recent"
 RAILWAY_ALERTA_V1 = "https://web-production-90ba9.up.railway.app/alerta/v1"
+TEST_ALERT_PIN = "123456"
+TEST_ALERT_TO = "+56999394909"
 # Claves acceso Twilio
-TWILIO_ACCOUNT_SID = "ACcf9e3f36ee842c4b6bcabaeb5aee188d"
-TWILIO_AUTH_TOKEN = "82bdff6dcae50f9dc88bd30672b50518"
+TWILIO_ACCOUNT_SID = "Clave"
+TWILIO_AUTH_TOKEN = "Clave"
 TWILIO_FROM_NUMBER ="+16079004736"
 # Config general
 MIN_EVENT_MAGNITUDE = "3"
