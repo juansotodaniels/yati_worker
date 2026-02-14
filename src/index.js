@@ -217,21 +217,17 @@ function buildMessage({ evento, locs, top }) {
   const mag = evento?.magnitud ?? "";
   const fecha = evento?.FechaHora ?? "";
   const ref = evento?.Referencia ?? "";
-  const id = evento?.id ?? "";
-  const uid = evento?.event_uid ?? "";
 
-  // listado compacto: "Localidad(I=5), Localidad2(I=4)..."
-  const list = (locs || []).slice(0, Math.min(top, 12)).map(x => {
-    const name = x?.localidad || "";
-    const I = x?.intensidad_predicha ?? "";
-    return `${name}(I=${I})`;
-  }).filter(Boolean);
+  const list = (locs || [])
+    .slice(0, Math.min(top, 6))
+    .map(x => `${x.localidad}(I=${x.intensidad_predicha})`)
+    .join(", ");
 
-  const extra = list.length ? ` | ${list.join(", ")}` : "";
+  const locPart = list ? ` Localidades con intensidad estimada: ${list}.` : "";
 
-  // SMS: corto y útil
-  return `YATI ALERTA SISMO | M=${mag} | ${fecha} | ${ref}${extra} | id=${id || uid}`;
+  return `YATI - Sistema de predicción de intensidad sísmica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}.${locPart}`;
 }
+
 
 async function twilioSms(env, to, body) {
   const sid = env.TWILIO_ACCOUNT_SID;
