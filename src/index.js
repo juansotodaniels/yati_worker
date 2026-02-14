@@ -262,12 +262,16 @@ async function twilioSms(env, to, body) {
   const token = env.TWILIO_AUTH_TOKEN;
   const from = env.TWILIO_FROM_NUMBER;
 
+  if (!sid || !token || !from) {
+    throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM).");
+  }
+
   const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
 
   const form = new URLSearchParams();
-  form.set("To", to);
-  form.set("From", from);
-  form.set("Body", body);
+  form.set("To", String(to).trim());
+  form.set("From", String(from).trim());
+  form.set("Body", String(body));
 
   const auth = btoa(`${sid}:${token}`);
 
@@ -280,8 +284,16 @@ async function twilioSms(env, to, body) {
     body: form.toString()
   });
 
-  if (!r.ok) throw new Error("Twilio SMS error");
+  const txt = await safeText(r);
+
+  if (!r.ok) {
+    // Twilio devuelve JSON con code/message normalmente
+    throw new Error(`Twilio SMS no OK: ${r.status} ${txt?.slice(0, 300)}`);
+  }
+
+  return txt;
 }
+
 
 async function twilioCall(env, to, text) {
   const sid = env.TWILIO_ACCOUNT_SID;
