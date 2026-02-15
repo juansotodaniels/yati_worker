@@ -1,10 +1,11 @@
 // src/index.js — YATI Worker (Cloudflare Workers)
 // - Cron: detecta sismo nuevo (XOR), consulta Railway /alerta/v1, filtra targets y envía por Twilio
+// - ✅ Genera/actualiza HTML público en KV llamando a Railway /build-public (cuando hay alerta)
+// - ✅ /public: sirve el HTML liviano desde KV (para miles/millones de consultas)
+// - ✅ /refresh-public: fuerza regeneración (protegido con token)
 // - Guarda en KV:
 //    - last_seen_event_id, last_seen_mag, last_seen_at
 //    - last_alerted_event_id, last_alerted_payload_id, last_alerted_mag, last_alerted_at
-// - Endpoint manual: /test-alert (protegido por ENABLE_TEST_ALERT + PIN)
-// - Endpoint TwiML: /twiml (para llamadas, opcional)
 
 export default {
   async scheduled(event, env, ctx) {
@@ -17,6 +18,21 @@ export default {
     // Health
     if (url.pathname === "/") {
       return new Response("YATI Worker activo");
+    }
+
+    // ✅ PUBLIC: HTML liviano servido desde KV (Cloudflare)
+    if (url.pathname === "/public") {
+      return servePublicHtml(env);
+    }
+
+    // ✅ Refresh manual del HTML público (protegido)
+    // Headers: Authorization: Bearer <BUILD_PUBLIC_TOKEN>
+    if (url.pathname === "/refresh-public") {
+      const ok = await authorizeBearer(request, env.BUILD_PUBLIC_TOKEN);
+      if (!ok) return new Response("Unauthorized", { status: 401 });
+
+      ctx.waitUntil(refreshPublicFromRailway(env, { reason: "manual" }));
+      return new Response("OK - refresh-public triggered");
     }
 
     // 🔒 TEST ALERT (protegido por ENABLE_TEST_ALERT)
@@ -66,7 +82,6 @@ function escapeXml(s) {
    LOG HELPER (más explícito)
 ================================= */
 function log(env, msg, extra) {
-  // LOG_LEVEL opcional: "debug" | "info" (default) | "silent"
   const lvl = String(env.LOG_LEVEL || "info").toLowerCase();
   if (lvl === "silent") return;
 
@@ -79,6 +94,140 @@ function log(env, msg, extra) {
   } catch {
     console.log(`${msg} ${String(extra)}`);
   }
+}
+
+/* ===============================
+   PUBLIC HTML (KV)
+================================= */
+
+function publicKvKey(env) {
+  return String(env.PUBLIC_HTML_KV_KEY || "public_html_v1");
+}
+
+function publicCacheTtl(env) {
+  const n = parseInt(env.PUBLIC_CACHE_TTL_SECONDS || "60", 10);
+  return Number.isFinite(n) && n > 0 ? n : 60;
+}
+
+// Sirve el HTML público desde KV. Si no existe, muestra aviso.
+async function servePublicHtml(env) {
+  if (!env.YATI_KV) {
+    return new Response("Falta binding KV env.YATI_KV", { status: 500 });
+  }
+
+  const key = publicKvKey(env);
+  const html = await env.YATI_KV.get(key);
+
+  if (!html) {
+    const msg = `Aún no se ha generado el HTML público.
+El Worker lo generará cuando haya un evento que dispare alerta, o puedes generarlo manualmente llamando /refresh-public (protegido).`;
+    return new Response(msg, {
+      status: 200,
+      headers: {
+        "Content-Type": "text/plain; charset=utf-8",
+        "Cache-Control": "no-store"
+      }
+    });
+  }
+
+  // Cache CDN (edge) para aguantar picos masivos.
+  // Ojo: igual estás sirviendo desde Cloudflare, el origin NO es Railway.
+  return new Response(html, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": `public, max-age=${publicCacheTtl(env)}`
+    }
+  });
+}
+
+// Llama a Railway /build-public, y luego descarga el HTML desde /public_static/index.html
+async function refreshPublicFromRailway(env, { reason = "auto", eventId = "", mag = "" } = {}) {
+  const RAILWAY_BASE_URL = env.RAILWAY_BASE_URL;
+  const token = env.BUILD_PUBLIC_TOKEN;
+
+  if (!env.YATI_KV) {
+    log(env, "[YATI] KV missing: env.YATI_KV");
+    return;
+  }
+  if (!RAILWAY_BASE_URL) {
+    log(env, "[YATI] No puedo refrescar public: falta env.RAILWAY_BASE_URL");
+    return;
+  }
+  if (!token) {
+    log(env, "[YATI] No puedo refrescar public: falta env.BUILD_PUBLIC_TOKEN");
+    return;
+  }
+
+  const base = RAILWAY_BASE_URL.replace(/\/$/, "");
+  const buildUrl = `${base}/build-public`;
+  const htmlUrl = `${base}/public_static/index.html`;
+
+  log(env, "[YATI] Refresh public: llamando /build-public", { reason, eventId, mag, buildUrl });
+
+  // 1) gatilla build
+  let buildJson;
+  try {
+    const r = await fetch(buildUrl, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "User-Agent": "YATI-Worker/1.0"
+      }
+    });
+    const t = await safeText(r);
+    if (!r.ok) {
+      log(env, "[YATI] build-public no OK", { status: r.status, body: t.slice(0, 300) });
+      return;
+    }
+    try { buildJson = JSON.parse(t); } catch { buildJson = { raw: t }; }
+  } catch (e) {
+    log(env, "[YATI] Error llamando build-public", { err: String(e) });
+    return;
+  }
+
+  // 2) descarga HTML listo
+  let html;
+  try {
+    const r2 = await fetch(htmlUrl, {
+      method: "GET",
+      headers: { "User-Agent": "YATI-Worker/1.0" }
+    });
+    const t2 = await safeText(r2);
+    if (!r2.ok) {
+      log(env, "[YATI] No pude descargar HTML público", { status: r2.status, body: t2.slice(0, 200), htmlUrl });
+      return;
+    }
+    html = t2;
+  } catch (e) {
+    log(env, "[YATI] Error descargando HTML público", { err: String(e), htmlUrl });
+    return;
+  }
+
+  // 3) guarda en KV
+  const key = publicKvKey(env);
+  await env.YATI_KV.put(key, html);
+  await env.YATI_KV.put("public_html_last_update", new Date().toISOString());
+  await env.YATI_KV.put("public_html_last_reason", String(reason));
+  if (eventId) await env.YATI_KV.put("public_html_last_event_id", String(eventId));
+  if (mag !== "") await env.YATI_KV.put("public_html_last_mag", String(mag));
+
+  log(env, "[YATI] Public HTML actualizado en KV", {
+    key,
+    bytes: html.length,
+    reason,
+    eventId,
+    mag,
+    build: buildJson?.ok ?? buildJson?.status ?? "unknown"
+  });
+}
+
+async function authorizeBearer(request, expectedToken) {
+  if (!expectedToken) return false;
+  const h = request.headers.get("Authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  if (!m) return false;
+  return m[1].trim() === String(expectedToken).trim();
 }
 
 /* ===============================
@@ -252,15 +401,23 @@ async function checkForNewEvent(env) {
     // Marcamos alertado para no repetir cada minuto si no hay destinatarios aplicables
     await markAlerted(env, latestId, mag, payloadId);
     log(env, "[YATI] Sin targets aplicables: marco last_alerted para no repetir", { latestId, mag, payloadId });
+
+    // Igual podemos refrescar HTML público (opcional). Si no quieres, comenta esta línea:
+    // await refreshPublicFromRailway(env, { reason: "no-targets", eventId: latestId, mag: String(mag) });
+
     return;
   }
 
   // --- 7) Mensaje ---
+  // ✅ IMPORTANTE: ahora mandamos link a Cloudflare /public (no Railway)
+  const publicUrl = (env.WORKER_PUBLIC_URL || "").replace(/\/$/, "") + "/public";
+
   const message = buildMessage({
     evento,
     locs,
     top: ALERTA_TOP,
-    minInt: MIN_INTENSITY_TO_SHOW
+    minInt: MIN_INTENSITY_TO_SHOW,
+    publicUrl
   });
 
   // --- 8) Envío Twilio ---
@@ -286,6 +443,10 @@ async function checkForNewEvent(env) {
   if (okCount > 0) {
     await markAlerted(env, latestId, mag, payloadId);
     log(env, "[YATI] Alerta finalizada OK (last_alerted actualizado)", { okCount, latestId, mag, payloadId });
+
+    // ✅ 10) Refrescar HTML público en Cloudflare KV (para que la gente consulte /public)
+    await refreshPublicFromRailway(env, { reason: "alert-sent", eventId: latestId, mag: String(mag) });
+
   } else {
     log(env, "[YATI] No se pudo enviar a nadie (okCount=0). No marco alertado.", { latestId, mag, payloadId });
   }
@@ -342,7 +503,7 @@ async function loadTargets(env) {
 }
 
 // Mensaje (incluye texto cuando no hay localidades sobre umbral)
-function buildMessage({ evento, locs, top, minInt }) {
+function buildMessage({ evento, locs, top, minInt, publicUrl }) {
   const mag = evento?.magnitud ?? "";
   const fecha = evento?.FechaHora ?? "";
   const ref = evento?.Referencia ?? "";
@@ -352,11 +513,13 @@ function buildMessage({ evento, locs, top, minInt }) {
     .map(x => `${x.localidad}(I=${x.intensidad_predicha})`)
     .join(", ");
 
+  const link = publicUrl ? ` Ver detalles: ${publicUrl}` : "";
+
   if (!list) {
-    return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. No hay localidades con intensidad estimada sobre el umbral ${minInt}.`;
+    return `YATI - Alerta. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. No hay localidades con intensidad sobre umbral ${minInt}.${link}`;
   }
 
-  return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. Localidades con intensidad estimada: ${list}.`;
+  return `YATI - Alerta. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. Localidades: ${list}.${link}`;
 }
 
 // Twilio SMS
@@ -446,5 +609,4 @@ async function markAlerted(env, eventId, mag, payloadId) {
 async function safeText(resp) {
   try { return await resp.text(); } catch { return ""; }
 }
-
 
