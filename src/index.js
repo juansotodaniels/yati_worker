@@ -1,6 +1,8 @@
 // src/index.js — YATI Worker (Cloudflare Workers)
 // - Cron: detecta sismo nuevo (XOR), consulta Railway /alerta/v1, filtra targets y envía por Twilio
-// - Guarda en KV: last_alerted_event_id, last_alerted_payload_id, last_alerted_mag, last_alerted_at
+// - Guarda en KV:
+//    - last_seen_event_id, last_seen_mag, last_seen_at
+//    - last_alerted_event_id, last_alerted_payload_id, last_alerted_mag, last_alerted_at
 // - Endpoint manual: /test-alert (protegido por ENABLE_TEST_ALERT + PIN)
 // - Endpoint TwiML: /twiml (para llamadas, opcional)
 
@@ -19,7 +21,6 @@ export default {
 
     // 🔒 TEST ALERT (protegido por ENABLE_TEST_ALERT)
     if (url.pathname === "/test-alert") {
-      // Si no está habilitado → 404 como si no existiera
       if (env.ENABLE_TEST_ALERT !== "1") {
         return new Response("Not Found", { status: 404 });
       }
@@ -62,6 +63,25 @@ function escapeXml(s) {
 }
 
 /* ===============================
+   LOG HELPER (más explícito)
+================================= */
+function log(env, msg, extra) {
+  // LOG_LEVEL opcional: "debug" | "info" (default) | "silent"
+  const lvl = String(env.LOG_LEVEL || "info").toLowerCase();
+  if (lvl === "silent") return;
+
+  if (extra === undefined) {
+    console.log(msg);
+    return;
+  }
+  try {
+    console.log(`${msg} ${JSON.stringify(extra)}`);
+  } catch {
+    console.log(`${msg} ${String(extra)}`);
+  }
+}
+
+/* ===============================
    FLUJO AUTOMÁTICO (CRON)
 ================================= */
 
@@ -83,34 +103,41 @@ async function checkForNewEvent(env) {
     return;
   }
 
-  // --- 1) Revisar XOR para detectar evento nuevo (con id) ---
+  log(env, "[YATI] Cron tick", {
+    minMagGlobal: MIN_EVENT_MAGNITUDE,
+    minIntToShow: MIN_INTENSITY_TO_SHOW,
+    top: ALERTA_TOP,
+    canal: CANAL
+  });
+
+  // --- 1) Revisar XOR ---
   let data;
   try {
     const resp = await fetch(XOR_URL, { cf: { cacheTtl: 0, cacheEverything: false } });
     if (!resp.ok) {
-      console.log("[YATI] XOR no OK:", resp.status);
+      log(env, "[YATI] XOR no OK", { status: resp.status });
       return;
     }
     data = await resp.json();
   } catch (e) {
-    console.log("[YATI] Error fetch XOR:", String(e));
+    log(env, "[YATI] Error fetch XOR", { err: String(e) });
     return;
   }
 
   const events = Array.isArray(data) ? data : (data?.events || data?.data || data?.results || []);
   if (!Array.isArray(events) || events.length === 0) {
-    console.log("[YATI] XOR sin events");
+    log(env, "[YATI] XOR sin events");
     return;
   }
 
   const latest = events[0];
   const latestId = String(latest?.id ?? "");
   if (!latestId) {
-    console.log("[YATI] event sin id");
+    log(env, "[YATI] event sin id (XOR)");
     return;
   }
 
-  // Magnitud robusta: puede venir como number, string o {value:...}
+  // Magnitud robusta
   const magRaw = latest?.magnitude;
   const magVal =
     typeof magRaw === "object" && magRaw !== null
@@ -119,38 +146,57 @@ async function checkForNewEvent(env) {
 
   const M = parseFloat(String(magVal).replace(",", "."));
   if (!Number.isFinite(M)) {
-    console.log("[YATI] No pude parsear magnitud para id:", latestId);
+    log(env, "[YATI] No pude parsear magnitud", { latestId, magVal });
     return;
   }
 
-  // Guardamos el último id alertado (no solo visto), para evitar llamadas repetidas
-  const storedId = await env.YATI_KV.get("last_alerted_event_id");
-  if (storedId === latestId) {
-    // Ya alertado, salimos silencioso
+  // ✅ 2) last_seen (siempre que cambie el latestId)
+  const prevSeen = await env.YATI_KV.get("last_seen_event_id");
+  if (prevSeen !== latestId) {
+    await markSeen(env, latestId, M);
+    log(env, "[YATI] Nuevo evento visto (last_seen actualizado)", { latestId, M, prevSeen });
+  } else {
+    log(env, "[YATI] Último evento visto sin cambios", { latestId, M });
+  }
+
+  // ✅ 3) last_alerted: evita repetir alertas del MISMO evento
+  const storedAlerted = await env.YATI_KV.get("last_alerted_event_id");
+  if (storedAlerted === latestId) {
+    log(env, "[YATI] Ya alertado, no repito", { latestId, M });
     return;
   }
 
-  // Si es nuevo PERO no cumple magnitud mínima, NO alertamos ni guardamos
+  // Filtro global de magnitud
   if (M < MIN_EVENT_MAGNITUDE) {
+    log(env, "[YATI] Evento nuevo pero bajo umbral global, no alerto", {
+      latestId,
+      M,
+      minMagGlobal: MIN_EVENT_MAGNITUDE
+    });
     return;
   }
 
-  // --- 2) Traer payload desde Railway (evento + intensidades) ---
+  log(env, "[YATI] Evento candidato a alerta (pasa umbral global)", { latestId, M });
+
+  // --- 4) Consultar Railway /alerta/v1 ---
   let payload;
+  let railwayUrl = "";
   try {
     const u = new URL(RAILWAY_BASE_URL.replace(/\/$/, "") + "/alerta/v1");
     u.searchParams.set("min_mag", String(MIN_EVENT_MAGNITUDE));
     u.searchParams.set("min_int", String(MIN_INTENSITY_TO_SHOW));
     u.searchParams.set("top", String(ALERTA_TOP));
+    railwayUrl = u.toString();
 
-    const r = await fetch(u.toString(), { headers: { "User-Agent": "YATI-Worker/1.0" } });
+    const r = await fetch(railwayUrl, { headers: { "User-Agent": "YATI-Worker/1.0" } });
     if (!r.ok) {
-      console.log("[YATI] Railway /alerta/v1 no OK:", r.status, (await safeText(r)).slice(0, 200));
+      const t = await safeText(r);
+      log(env, "[YATI] Railway /alerta/v1 no OK", { status: r.status, body: t.slice(0, 200) });
       return;
     }
     payload = await r.json();
   } catch (e) {
-    console.log("[YATI] Error Railway:", String(e));
+    log(env, "[YATI] Error Railway", { err: String(e), railwayUrl });
     return;
   }
 
@@ -158,7 +204,7 @@ async function checkForNewEvent(env) {
   const mag = Number(evento?.magnitud ?? M);
   const locs = Array.isArray(payload?.localidades) ? payload.localidades : [];
 
-  // ✅ NUEVO: payloadId (si Railway trae id en evento; si no, usa latestId)
+  // payloadId (si Railway trae id; si no, usa latestId)
   const payloadId = String(
     evento?.id ??
     evento?.event_id ??
@@ -167,18 +213,27 @@ async function checkForNewEvent(env) {
     latestId
   );
 
+  log(env, "[YATI] Railway OK", {
+    latestId,
+    payloadId,
+    mag,
+    locCount: locs.length
+  });
+
   const locNames = new Set(
     locs.map(x => String(x?.localidad || "").toLowerCase()).filter(Boolean)
   );
 
-  // --- 3) Cargar targets desde KV ---
+  // --- 5) Targets desde KV ---
   const targets = await loadTargets(env);
+  log(env, "[YATI] Targets cargados", { count: targets.length });
+
   if (!targets.length) {
-    console.log("[YATI] No hay targets (alert_targets_v1 vacío). No envío.");
+    log(env, "[YATI] No hay targets (alert_targets_v1 vacío). No envío.");
     return;
   }
 
-  // --- 4) Filtrar targets según reglas ---
+  // --- 6) Filtrado targets ---
   const selected = targets.filter(t => {
     if (!t.enabled) return false;
 
@@ -186,18 +241,21 @@ async function checkForNewEvent(env) {
     if (mag < minMagUser) return false;
 
     const loc = String(t.localidad || "").trim();
-    if (!loc) return true; // sin localidad => a todas
+    if (!loc) return true;
 
     return locNames.has(loc.toLowerCase());
   });
 
+  log(env, "[YATI] Targets seleccionados", { selected: selected.length, total: targets.length });
+
   if (!selected.length) {
     // Marcamos alertado para no repetir cada minuto si no hay destinatarios aplicables
     await markAlerted(env, latestId, mag, payloadId);
+    log(env, "[YATI] Sin targets aplicables: marco last_alerted para no repetir", { latestId, mag, payloadId });
     return;
   }
 
-  // --- 5) Armar mensaje (Institucional, ASCII-friendly) ---
+  // --- 7) Mensaje ---
   const message = buildMessage({
     evento,
     locs,
@@ -205,7 +263,7 @@ async function checkForNewEvent(env) {
     minInt: MIN_INTENSITY_TO_SHOW
   });
 
-  // --- 6) Enviar por Twilio ---
+  // --- 8) Envío Twilio ---
   let okCount = 0;
   for (const t of selected) {
     const to = String(t.phone || "").trim();
@@ -218,16 +276,18 @@ async function checkForNewEvent(env) {
         await twilioSms(env, to, message);
       }
       okCount++;
+      log(env, "[YATI] SMS enviado OK", { to });
     } catch (e) {
-      console.log("[YATI] Error Twilio para", to, String(e));
+      log(env, "[YATI] Error Twilio", { to, err: String(e) });
     }
   }
 
-  // --- 7) Solo si enviamos al menos 1, marcamos como alertado ---
+  // --- 9) Marcar alertado ---
   if (okCount > 0) {
     await markAlerted(env, latestId, mag, payloadId);
+    log(env, "[YATI] Alerta finalizada OK (last_alerted actualizado)", { okCount, latestId, mag, payloadId });
   } else {
-    console.log("[YATI] No se pudo enviar a nadie (okCount=0). No marco alertado.");
+    log(env, "[YATI] No se pudo enviar a nadie (okCount=0). No marco alertado.", { latestId, mag, payloadId });
   }
 }
 
@@ -243,39 +303,19 @@ async function testManualAlert(env, forceTo = "", customMsg = "") {
 
   const toFixed = (forceTo || "").trim();
 
-  // Si se define TEST_ALERT_TO (o query param to=), mandamos solo a ese numero
   if (toFixed) {
-    try {
-      await twilioSms(env, toFixed, msg);
-      console.log("[TEST] Enviado a (forceTo):", toFixed);
-    } catch (e) {
-      console.log("[TEST] Error enviando a (forceTo):", toFixed, String(e));
-    }
+    await twilioSms(env, toFixed, msg);
+    console.log("[TEST] Enviado a (forceTo):", toFixed);
     return;
   }
 
-  // Si no, enviamos a todos los targets habilitados
   const targets = await loadTargets(env);
-  if (!targets.length) {
-    console.log("[TEST] No hay targets en KV (alert_targets_v1)");
-    return;
-  }
-
-  let sent = 0;
   for (const t of targets) {
-    if (!t.enabled) continue;
-    const to = String(t.phone || "").trim();
-    if (!to) continue;
-
-    try {
-      await twilioSms(env, to, msg);
-      sent++;
-      console.log("[TEST] Enviado a:", to);
-    } catch (e) {
-      console.log("[TEST] Error enviando a:", to, String(e));
+    if (t.enabled) {
+      await twilioSms(env, t.phone, msg);
+      console.log("[TEST] Enviado a:", t.phone);
     }
   }
-  console.log("[TEST] Total enviados:", sent);
 }
 
 /* ===============================
@@ -301,7 +341,7 @@ async function loadTargets(env) {
   }
 }
 
-// ---- MENSAJE (Institucional, sin ID, ASCII-friendly) ----
+// Mensaje (incluye texto cuando no hay localidades sobre umbral)
 function buildMessage({ evento, locs, top, minInt }) {
   const mag = evento?.magnitud ?? "";
   const fecha = evento?.FechaHora ?? "";
@@ -319,7 +359,7 @@ function buildMessage({ evento, locs, top, minInt }) {
   return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. Localidades con intensidad estimada: ${list}.`;
 }
 
-// ---- TWILIO SMS ----
+// Twilio SMS
 async function twilioSms(env, to, body) {
   const sid = env.TWILIO_ACCOUNT_SID;
   const token = env.TWILIO_AUTH_TOKEN;
@@ -348,15 +388,13 @@ async function twilioSms(env, to, body) {
   });
 
   const txt = await safeText(r);
-
   if (!r.ok) {
     throw new Error(`Twilio SMS no OK: ${r.status} ${txt?.slice(0, 300)}`);
   }
-
   return txt;
 }
 
-// ---- TWILIO CALL (opcional futuro) ----
+// Twilio Call (opcional futuro)
 async function twilioCall(env, to, text) {
   const sid = env.TWILIO_ACCOUNT_SID;
   const token = env.TWILIO_AUTH_TOKEN;
@@ -390,7 +428,14 @@ async function twilioCall(env, to, text) {
   if (!r.ok) throw new Error(`Twilio CALL no OK: ${r.status} ${txt?.slice(0, 300)}`);
 }
 
-// ---- KV: marcar alertado ----
+// ✅ last_seen: trazabilidad (aunque no alerte)
+async function markSeen(env, eventId, mag) {
+  await env.YATI_KV.put("last_seen_event_id", String(eventId));
+  await env.YATI_KV.put("last_seen_mag", String(mag));
+  await env.YATI_KV.put("last_seen_at", new Date().toISOString());
+}
+
+// last_alerted: cuando decidimos “no repetir este evento”
 async function markAlerted(env, eventId, mag, payloadId) {
   await env.YATI_KV.put("last_alerted_event_id", String(eventId));
   await env.YATI_KV.put("last_alerted_payload_id", String(payloadId || eventId));
@@ -401,4 +446,5 @@ async function markAlerted(env, eventId, mag, payloadId) {
 async function safeText(resp) {
   try { return await resp.text(); } catch { return ""; }
 }
+
 
