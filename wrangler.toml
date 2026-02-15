@@ -9,18 +9,5 @@ crons = ["* * * * *"]
 binding = "YATI_KV"
 id = "28fd8f5831ea4ce3afd26bdaaa29990b"
 
-[vars]
-RAILWAY_BASE_URL = "https://web-production-90ba9.up.railway.app"
-XOR_API_URL = "https://api.xor.cl/sismo/recent"
-
-# Config general
-MIN_EVENT_MAGNITUDE = "3"
-MIN_INTENSITY_TO_SHOW = "3"
-ALERTA_TOP = "10"
-ALERTA_CANAL = "sms"
-
-# Seguridad (apagado por defecto)
-ENABLE_TEST_ALERT = "0"
-
 [observability.logs]
 enabled = true
