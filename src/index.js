@@ -20,6 +20,9 @@
 //
 // ✅ NUEVO (Problema 2: signos raros en SMS):
 //   - Elimina ¿ ¡ ? ! del SMS para evitar caracteres “problemáticos” en algunos equipos/carriers
+//
+// ✅ NUEVO (Problema logo/asset relativo en /public):
+//   - Antes de guardar HTML en KV, reescribe rutas relativas (src/href) a URLs absolutas apuntando a Railway.
 
 export default {
   async scheduled(event, env, ctx) {
@@ -218,7 +221,7 @@ function buildPublicPlaceholder(env, lastAt, why) {
 async function refreshPublicHtml(env, meta) {
   const RAILWAY_BASE_URL = env.RAILWAY_BASE_URL;
 
-  // ✅ AHORA: soporta Secret Store (binding) o string
+  // ✅ soporta Secret Store (binding) o string
   const token = await getEnvValue(env, "RAILWAY_BUILD_PUBLIC_TOKEN");
 
   if (!env.YATI_KV) return log(env, "[YATI] refreshPublicHtml: falta KV");
@@ -245,12 +248,16 @@ async function refreshPublicHtml(env, meta) {
   // 2) Leer HTML desde Railway /public (snapshot liviano)
   const publicRailwayUrl = `${RAILWAY_BASE_URL.replace(/\/$/, "")}/public`;
   const h = await fetch(publicRailwayUrl, { headers: { "User-Agent": "YATI-Worker/1.0" } });
-  const html = await safeText(h);
+
+  let html = await safeText(h);
 
   if (!h.ok || !html || html.length < 200) {
     log(env, "[YATI] No pude leer HTML desde Railway /public", { status: h.status, bytes: html?.length || 0 });
     return;
   }
+
+  // ✅ FIX: convertir assets relativos a absolutos apuntando a Railway
+  html = absolutizeAssets(html, RAILWAY_BASE_URL);
 
   await env.YATI_KV.put("public_html_v1", html);
   await env.YATI_KV.put("public_html_last_at", new Date().toISOString());
@@ -774,4 +781,26 @@ async function safeText(resp) {
   try { return await resp.text(); } catch { return ""; }
 }
 
+/* ===============================
+   ✅ ABSOLUTIZAR ASSETS (logo, css, js)
+   Convierte src/href relativos para que apunten a Railway.
+   Ej: src="/static/logo.png" -> src="https://railway.../static/logo.png"
+================================= */
+function absolutizeAssets(html, baseUrl) {
+  const base = String(baseUrl || "").replace(/\/$/, "");
+  if (!base) return html;
 
+  // src="/algo" -> src="https://railway/algo"
+  html = html.replace(/src="\/(.*?)"/g, `src="${base}/$1"`);
+
+  // href="/algo" -> href="https://railway/algo"
+  html = html.replace(/href="\/(.*?)"/g, `href="${base}/$1"`);
+
+  // src="static/..." -> src="https://railway/static/..."
+  html = html.replace(/src="static\/(.*?)"/g, `src="${base}/static/$1"`);
+
+  // href="static/..." -> href="https://railway/static/..."
+  html = html.replace(/href="static\/(.*?)"/g, `href="${base}/static/$1"`);
+
+  return html;
+}
