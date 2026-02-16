@@ -46,11 +46,14 @@ export default {
       }
 
       const pin = url.searchParams.get("pin") || "";
-      if (!env.TEST_ALERT_PIN || pin !== env.TEST_ALERT_PIN) {
+
+      const pinSecret = await getEnvValue(env, "TEST_ALERT_PIN");
+      if (!pinSecret || pin !== pinSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
 
-      const to = url.searchParams.get("to") || env.TEST_ALERT_TO || "";
+      const defaultTo = await getEnvValue(env, "TEST_ALERT_TO");
+      const to = url.searchParams.get("to") || defaultTo || "";
       const customMsg = url.searchParams.get("msg") || "";
 
       ctx.waitUntil(testManualAlert(env, to, customMsg));
@@ -108,6 +111,27 @@ function log(env, msg, extra) {
   } catch {
     console.log(`${msg} ${String(extra)}`);
   }
+}
+
+/* ===============================
+   ✅ ENV/SECRETS HELPER
+   - Soporta:
+     1) vars/secrets clásicos (string en env.NAME)
+     2) Secrets Store bindings (env.NAME.get())
+================================= */
+async function getEnvValue(env, name) {
+  const v = env?.[name];
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "object" && typeof v.get === "function") {
+    try {
+      const got = await v.get();
+      return typeof got === "string" ? got : "";
+    } catch {
+      return "";
+    }
+  }
+  return "";
 }
 
 /* ===============================
@@ -193,7 +217,9 @@ function buildPublicPlaceholder(env, lastAt, why) {
 
 async function refreshPublicHtml(env, meta) {
   const RAILWAY_BASE_URL = env.RAILWAY_BASE_URL;
-  const token = env.RAILWAY_BUILD_PUBLIC_TOKEN; // ✅ SECRET
+
+  // ✅ AHORA: soporta Secret Store (binding) o string
+  const token = await getEnvValue(env, "RAILWAY_BUILD_PUBLIC_TOKEN");
 
   if (!env.YATI_KV) return log(env, "[YATI] refreshPublicHtml: falta KV");
   if (!RAILWAY_BASE_URL) return log(env, "[YATI] refreshPublicHtml: falta RAILWAY_BASE_URL");
@@ -471,7 +497,6 @@ async function checkForNewEvent(env) {
 ================================= */
 
 async function testManualAlert(env, forceTo = "", customMsg = "") {
-  // Si envias custom, igual lo “sanitizamos” para evitar Unicode y exceso
   const defaultMsg = "YATI TEST | 14-Feb 21:09 | Test manual | OK";
   const msgRaw =
     (customMsg && customMsg.trim())
@@ -523,8 +548,6 @@ async function loadTargets(env) {
 
 /* ===============================
    MENSAJE COMPACTO (Trial-friendly)
-   Formato:
-   YATI M3.9 | 14-Feb 21:09 | Ref | Talca(4), SanJ(3), ...
 ================================= */
 
 function buildMessageCompact(env, { evento, locs, top }) {
@@ -534,13 +557,12 @@ function buildMessageCompact(env, { evento, locs, top }) {
   const dt = formatFechaHora(evento?.FechaHora);
   const ref = compactRef(evento?.Referencia);
 
-  // Lista localidades: max 7 (o top si menor)
   const maxLoc = Math.max(0, Math.min(parseInt(top || 0, 10) || 0, 7)) || 7;
 
   const list = (Array.isArray(locs) ? locs : [])
     .slice(0, maxLoc)
     .map(x => {
-      const name = shortenName(String(x?.localidad || ""), 6); // "SanJ" style
+      const name = shortenName(String(x?.localidad || ""), 6);
       const I = String(x?.intensidad_predicha ?? "").trim();
       return `${name}(${I})`;
     })
@@ -550,7 +572,6 @@ function buildMessageCompact(env, { evento, locs, top }) {
   let msg = `YATI M${magStr} | ${dt} | ${ref}`;
   if (list) msg += ` | ${list}`;
 
-  // ✅ Quitar ¿¡!? + ASCII-only + clamp
   msg = stripPunct(msg);
   msg = toAscii(msg);
   msg = clampSmsAscii(env, msg);
@@ -559,7 +580,6 @@ function buildMessageCompact(env, { evento, locs, top }) {
 }
 
 function stripPunct(s) {
-  // Problema 2: eliminar ¿ ¡ ? !
   return String(s || "")
     .replaceAll("¿", "")
     .replaceAll("¡", "")
@@ -573,8 +593,6 @@ function safeNum(x) {
 }
 
 function formatFechaHora(fechaStr) {
-  // Entrada esperada: "DD-MM-YYYY HH:MM:SS" (de tu app.py)
-  // Salida: "14-Feb 21:09"
   const s = String(fechaStr || "").trim();
   const m = s.match(/^(\d{2})-(\d{2})-(\d{4})\s+(\d{2}):(\d{2})(?::\d{2})?$/);
   if (!m) return "NA";
@@ -592,12 +610,10 @@ function formatFechaHora(fechaStr) {
 }
 
 function compactRef(ref) {
-  // Mantener corto, sin tildes, y evitar pipes
   let s = String(ref || "NoRef").trim();
   s = s.replaceAll("|", " ");
   s = s.replace(/\s+/g, " ");
 
-  // Intenta acortar típico: "12 km al SE de Talca" -> "12 km SE Talca"
   s = s
     .replace(/\bal\s+/gi, " ")
     .replace(/\bde\s+/gi, " ")
@@ -609,23 +625,19 @@ function compactRef(ref) {
     .replace(/\bSureste\b/gi, "SE")
     .replace(/\bSuroeste\b/gi, "SW");
 
-  // "al SE de" variantes
   s = s.replace(/\b(SE|SW|NE|NW)\s+de\s+/gi, "$1 ");
 
-  // Tope por largo
   s = s.length > 32 ? (s.slice(0, 32).trim() + "...") : s;
   return toAscii(stripPunct(s));
 }
 
 function shortenName(name, maxLen = 6) {
-  // Quita tildes, deja A-Z0-9, saca espacios
   let s = toAscii(stripPunct(String(name || "").trim()));
   s = s.replace(/[^A-Za-z0-9 ]/g, "");
   s = s.replace(/\s+/g, " ").trim();
 
   if (!s) return "";
 
-  // Heurística: si tiene varias palabras, usa primera + inicial(es)
   const parts = s.split(" ").filter(Boolean);
   if (parts.length >= 2) {
     const first = parts[0];
@@ -634,24 +646,17 @@ function shortenName(name, maxLen = 6) {
     return candidate;
   }
 
-  // Una palabra: corta
   if (s.length <= maxLen) return s;
   return s.slice(0, maxLen);
 }
 
 function toAscii(input) {
-  // Remueve diacríticos y reemplaza algunos caracteres raros
   let s = String(input || "");
-  // Normaliza y quita tildes
   try {
     s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
-  } catch {
-    // Si el runtime no soporta normalize, igual seguimos
-  }
-  // Reemplazos comunes
+  } catch {}
   s = s.replaceAll("ñ", "n").replaceAll("Ñ", "N");
   s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
-  // También evitar guiones raros
   s = s.replace(/[–—]/g, "-");
   return s;
 }
@@ -660,18 +665,15 @@ function clampSmsAscii(env, body) {
   const maxLen = parseInt(env.SMS_MAX_LEN || "155", 10);
   let s = String(body || "");
 
-  // Limpieza final: espacios
   s = s.replace(/\s+/g, " ").trim();
 
   if (s.length <= maxLen) return s;
 
-  // Corte duro, pero intenta no cortar en medio de palabra
   let cut = s.slice(0, maxLen);
   const lastComma = cut.lastIndexOf(",");
   const lastBar = cut.lastIndexOf("|");
   const lastSpace = cut.lastIndexOf(" ");
 
-  // Preferimos cortar en separadores “naturales”
   const pivot = Math.max(lastComma, lastBar, lastSpace);
   if (pivot > 40) cut = cut.slice(0, pivot).trim();
 
@@ -679,17 +681,17 @@ function clampSmsAscii(env, body) {
 }
 
 /* ===============================
-   TWILIO
+   TWILIO (✅ Secrets Store compatible)
 ================================= */
 
 // Twilio SMS
 async function twilioSms(env, to, body) {
-  const sid = env.TWILIO_ACCOUNT_SID;
-  const token = env.TWILIO_AUTH_TOKEN;
-  const from = env.TWILIO_FROM_NUMBER;
+  const sid = await getEnvValue(env, "TWILIO_ACCOUNT_SID");
+  const token = await getEnvValue(env, "TWILIO_AUTH_TOKEN");
+  const from = await getEnvValue(env, "TWILIO_FROM_NUMBER");
 
   if (!sid || !token || !from) {
-    throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM).");
+    throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM). Revisa Secrets Store bindings.");
   }
 
   const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
@@ -719,9 +721,9 @@ async function twilioSms(env, to, body) {
 
 // Twilio Call (opcional futuro)
 async function twilioCall(env, to, text) {
-  const sid = env.TWILIO_ACCOUNT_SID;
-  const token = env.TWILIO_AUTH_TOKEN;
-  const from = env.TWILIO_FROM_NUMBER;
+  const sid = await getEnvValue(env, "TWILIO_ACCOUNT_SID");
+  const token = await getEnvValue(env, "TWILIO_AUTH_TOKEN");
+  const from = await getEnvValue(env, "TWILIO_FROM_NUMBER");
 
   if (!sid || !token || !from) throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM).");
   if (!env.WORKER_PUBLIC_URL) throw new Error("Falta env.WORKER_PUBLIC_URL (ej: https://tu-worker.workers.dev)");
@@ -755,14 +757,12 @@ async function twilioCall(env, to, text) {
    KV: last_seen / last_alerted
 ================================= */
 
-// ✅ last_seen: trazabilidad (aunque no alerte)
 async function markSeen(env, eventId, mag) {
   await env.YATI_KV.put("last_seen_event_id", String(eventId));
   await env.YATI_KV.put("last_seen_mag", String(mag));
   await env.YATI_KV.put("last_seen_at", new Date().toISOString());
 }
 
-// last_alerted: cuando decidimos “no repetir este evento”
 async function markAlerted(env, eventId, mag, payloadId) {
   await env.YATI_KV.put("last_alerted_event_id", String(eventId));
   await env.YATI_KV.put("last_alerted_payload_id", String(payloadId || eventId));
@@ -773,4 +773,5 @@ async function markAlerted(env, eventId, mag, payloadId) {
 async function safeText(resp) {
   try { return await resp.text(); } catch { return ""; }
 }
+
 
