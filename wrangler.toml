@@ -50,6 +50,10 @@ binding = "TEST_ALERT_TO"
 store_id = "69df0156afc742099c6c0973ba8ce629"
 secret_name = "TEST_ALERT_TO"
 
+[[secrets_store_secrets]]
+binding = "RAILWAY_BUILD_PUBLIC_TOKEN"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "RAILWAY_BUILD_PUBLIC_TOKEN"
 
 [observability.logs]
 enabled = true
