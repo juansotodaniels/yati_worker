@@ -12,6 +12,14 @@
 //   - Máximo 7 localidades (configurable por env ALERTA_TOP, default 7)
 //   - Corte duro por longitud (env SMS_MAX_LEN, default 155)
 //   - Limpieza de caracteres raros y acortado de nombres
+//
+// ✅ NUEVO (Problema 1: Self-healing HTML):
+//   - Endpoint /public que sirve HTML desde KV (public_html_v1)
+//   - Si KV está vacío: llama Railway /build-public y luego lee Railway /public para poblar KV
+//   - Opcional refresco periódico: PUBLIC_REFRESH_MINUTES (0 desactiva)
+//
+// ✅ NUEVO (Problema 2: signos raros en SMS):
+//   - Elimina ¿ ¡ ? ! del SMS para evitar caracteres “problemáticos” en algunos equipos/carriers
 
 export default {
   async scheduled(event, env, ctx) {
@@ -24,6 +32,11 @@ export default {
     // Health
     if (url.pathname === "/") {
       return new Response("YATI Worker activo");
+    }
+
+    // ✅ PUBLIC (sirve HTML desde KV; self-healing si falta)
+    if (url.pathname === "/public") {
+      return servePublicHtml(env, ctx, { reason: "public-hit" });
     }
 
     // 🔒 TEST ALERT (protegido por ENABLE_TEST_ALERT)
@@ -69,6 +82,15 @@ function escapeXml(s) {
     .replaceAll("'", "&apos;");
 }
 
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
 /* ===============================
    LOG HELPER (más explícito)
 ================================= */
@@ -86,6 +108,132 @@ function log(env, msg, extra) {
   } catch {
     console.log(`${msg} ${String(extra)}`);
   }
+}
+
+/* ===============================
+   PUBLIC HTML (KV) + SELF-HEALING
+================================= */
+
+async function servePublicHtml(env, ctx, { reason }) {
+  if (!env.YATI_KV) {
+    return new Response("KV not bound (YATI_KV)", { status: 500 });
+  }
+
+  const key = "public_html_v1";
+  const lastAtKey = "public_html_last_at";
+
+  let html = await env.YATI_KV.get(key);
+  const lastAt = await env.YATI_KV.get(lastAtKey);
+
+  // ✅ Si falta, disparar self-healing (no bloqueante)
+  const forceOnEmpty = String(env.PUBLIC_REFRESH_FORCE_ON_EMPTY || "1") === "1";
+  if ((!html || html.length < 200) && forceOnEmpty) {
+    log(env, "[YATI] KV sin public_html_v1 -> self-healing", { reason });
+
+    ctx.waitUntil(refreshPublicHtml(env, { reason: "self-heal-empty" }));
+
+    return new Response(buildPublicPlaceholder(env, lastAt, "Generando pagina..."), {
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      status: 200
+    });
+  }
+
+  // ✅ Refresco periódico opcional aunque exista HTML
+  const refreshMin = parseInt(env.PUBLIC_REFRESH_MINUTES || "0", 10);
+  if (refreshMin > 0 && shouldRefresh(lastAt, refreshMin)) {
+    ctx.waitUntil(refreshPublicHtml(env, { reason: "periodic-refresh" }));
+  }
+
+  if (!html) {
+    return new Response(buildPublicPlaceholder(env, lastAt, "Pagina aun no generada."), {
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      status: 200
+    });
+  }
+
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=20"
+    },
+    status: 200
+  });
+}
+
+function shouldRefresh(lastAtIso, minutes) {
+  if (!lastAtIso) return true;
+  const t = Date.parse(lastAtIso);
+  if (!Number.isFinite(t)) return true;
+  return (Date.now() - t) > minutes * 60 * 1000;
+}
+
+function buildPublicPlaceholder(env, lastAt, why) {
+  const workerUrl = env.WORKER_PUBLIC_URL || "";
+  const publicUrl = workerUrl ? `${workerUrl.replace(/\/$/, "")}/public` : "/public";
+  const last = lastAt ? lastAt : "No disponible";
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>YATI</title>
+</head>
+<body style="font-family:Arial,sans-serif; padding:18px; max-width:900px; margin:0 auto;">
+  <div style="padding:16px; border:1px solid #ddd; background:#fafafa; border-radius:12px;">
+    <div style="font-size:18px; font-weight:700;">${escapeHtml(why)}</div>
+    <div style="margin-top:10px; color:#555; font-size:13px;">
+      Ultima marca en KV: <b>${escapeHtml(last)}</b><br/>
+      Recarga en 15-30 segundos: <a href="${escapeHtml(publicUrl)}">${escapeHtml(publicUrl)}</a>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+async function refreshPublicHtml(env, meta) {
+  const RAILWAY_BASE_URL = env.RAILWAY_BASE_URL;
+  const token = env.RAILWAY_BUILD_PUBLIC_TOKEN; // ✅ SECRET
+
+  if (!env.YATI_KV) return log(env, "[YATI] refreshPublicHtml: falta KV");
+  if (!RAILWAY_BASE_URL) return log(env, "[YATI] refreshPublicHtml: falta RAILWAY_BASE_URL");
+  if (!token) return log(env, "[YATI] refreshPublicHtml: falta RAILWAY_BUILD_PUBLIC_TOKEN");
+
+  const buildUrl = `${RAILWAY_BASE_URL.replace(/\/$/, "")}/build-public`;
+  log(env, "[YATI] Refresh public: llamando /build-public", { ...meta, buildUrl });
+
+  // 1) Disparar build en Railway (protegido)
+  const r = await fetch(buildUrl, {
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "User-Agent": "YATI-Worker/1.0"
+    }
+  });
+
+  const txt = await safeText(r);
+  if (!r.ok) {
+    log(env, "[YATI] /build-public no OK", { status: r.status, body: txt.slice(0, 250) });
+    return;
+  }
+
+  // 2) Leer HTML desde Railway /public (snapshot liviano)
+  const publicRailwayUrl = `${RAILWAY_BASE_URL.replace(/\/$/, "")}/public`;
+  const h = await fetch(publicRailwayUrl, { headers: { "User-Agent": "YATI-Worker/1.0" } });
+  const html = await safeText(h);
+
+  if (!h.ok || !html || html.length < 200) {
+    log(env, "[YATI] No pude leer HTML desde Railway /public", { status: h.status, bytes: html?.length || 0 });
+    return;
+  }
+
+  await env.YATI_KV.put("public_html_v1", html);
+  await env.YATI_KV.put("public_html_last_at", new Date().toISOString());
+
+  log(env, "[YATI] Public HTML actualizado en KV", {
+    key: "public_html_v1",
+    bytes: html.length,
+    reason: meta?.reason || "unknown"
+  });
 }
 
 /* ===============================
@@ -183,6 +331,13 @@ async function checkForNewEvent(env) {
       M,
       minMagGlobal: MIN_EVENT_MAGNITUDE
     });
+
+    // ✅ Self-healing: si KV no tiene HTML, lo generamos igual
+    const html = await env.YATI_KV.get("public_html_v1");
+    if ((!html || html.length < 200) && String(env.PUBLIC_REFRESH_FORCE_ON_EMPTY || "1") === "1") {
+      await refreshPublicHtml(env, { reason: "self-heal-under-threshold", eventId: latestId, mag: String(M) });
+    }
+
     return;
   }
 
@@ -240,6 +395,10 @@ async function checkForNewEvent(env) {
 
   if (!targets.length) {
     log(env, "[YATI] No hay targets (alert_targets_v1 vacio). No envio.");
+
+    // ✅ Igual refrescamos HTML publico para que se vea el evento
+    await refreshPublicHtml(env, { reason: "no-targets-refresh", eventId: latestId, mag: String(mag) });
+
     return;
   }
 
@@ -261,6 +420,10 @@ async function checkForNewEvent(env) {
   if (!selected.length) {
     await markAlerted(env, latestId, mag, payloadId);
     log(env, "[YATI] Sin targets aplicables: marco last_alerted para no repetir", { latestId, mag, payloadId });
+
+    // ✅ Igual refrescamos HTML publico
+    await refreshPublicHtml(env, { reason: "no-selected-refresh", eventId: latestId, mag: String(mag) });
+
     return;
   }
 
@@ -294,6 +457,10 @@ async function checkForNewEvent(env) {
   if (okCount > 0) {
     await markAlerted(env, latestId, mag, payloadId);
     log(env, "[YATI] Alerta finalizada OK (last_alerted actualizado)", { okCount, latestId, mag, payloadId });
+
+    // ✅ Self-healing / refresh público cuando se envió alerta
+    await refreshPublicHtml(env, { reason: "alert-sent", eventId: latestId, mag: String(mag) });
+
   } else {
     log(env, "[YATI] No se pudo enviar a nadie (okCount=0). No marco alertado.", { latestId, mag, payloadId });
   }
@@ -311,7 +478,8 @@ async function testManualAlert(env, forceTo = "", customMsg = "") {
       ? customMsg.trim()
       : defaultMsg;
 
-  const msg = clampSmsAscii(env, toAscii(msgRaw));
+  // ✅ ASCII + sin ¿¡!? + clamp
+  const msg = clampSmsAscii(env, toAscii(stripPunct(msgRaw)));
 
   const toFixed = (forceTo || "").trim();
 
@@ -382,10 +550,21 @@ function buildMessageCompact(env, { evento, locs, top }) {
   let msg = `YATI M${magStr} | ${dt} | ${ref}`;
   if (list) msg += ` | ${list}`;
 
-  // ASCII-only + corte
+  // ✅ Quitar ¿¡!? + ASCII-only + clamp
+  msg = stripPunct(msg);
   msg = toAscii(msg);
   msg = clampSmsAscii(env, msg);
+
   return msg;
+}
+
+function stripPunct(s) {
+  // Problema 2: eliminar ¿ ¡ ? !
+  return String(s || "")
+    .replaceAll("¿", "")
+    .replaceAll("¡", "")
+    .replaceAll("?", "")
+    .replaceAll("!", "");
 }
 
 function safeNum(x) {
@@ -435,12 +614,12 @@ function compactRef(ref) {
 
   // Tope por largo
   s = s.length > 32 ? (s.slice(0, 32).trim() + "...") : s;
-  return toAscii(s);
+  return toAscii(stripPunct(s));
 }
 
 function shortenName(name, maxLen = 6) {
   // Quita tildes, deja A-Z0-9, saca espacios
-  let s = toAscii(String(name || "").trim());
+  let s = toAscii(stripPunct(String(name || "").trim()));
   s = s.replace(/[^A-Za-z0-9 ]/g, "");
   s = s.replace(/\s+/g, " ").trim();
 
@@ -472,6 +651,8 @@ function toAscii(input) {
   // Reemplazos comunes
   s = s.replaceAll("ñ", "n").replaceAll("Ñ", "N");
   s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  // También evitar guiones raros
+  s = s.replace(/[–—]/g, "-");
   return s;
 }
 
