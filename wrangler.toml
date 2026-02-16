@@ -13,14 +13,48 @@ id = "28fd8f5831ea4ce3afd26bdaaa29990b"
 RAILWAY_BASE_URL = "https://web-production-90ba9.up.railway.app"
 XOR_API_URL = "https://api.xor.cl/sismo/recent"
 
-# Config general
 MIN_EVENT_MAGNITUDE = "3"
 MIN_INTENSITY_TO_SHOW = "3"
 ALERTA_TOP = "10"
 ALERTA_CANAL = "sms"
 
-# Seguridad (apagado por defecto)
 ENABLE_TEST_ALERT = "0"
+
+# ==========================
+# Secrets Store bindings
+# (1 binding = 1 secret)
+# ==========================
+
+[[secrets_store_secrets]]
+binding = "TWILIO_ACCOUNT_SID"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TWILIO_ACCOUNT_SID"
+
+[[secrets_store_secrets]]
+binding = "TWILIO_AUTH_TOKEN"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TWILIO_AUTH_TOKEN"
+
+[[secrets_store_secrets]]
+binding = "TWILIO_FROM_NUMBER"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TWILIO_FROM_NUMBER"
+
+[[secrets_store_secrets]]
+binding = "TEST_ALERT_PIN"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TEST_ALERT_PIN"
+
+[[secrets_store_secrets]]
+binding = "TEST_ALERT_TO"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TEST_ALERT_TO"
+
+[[secrets_store_secrets]]
+binding = "BUILD_PUBLIC_TOKEN"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "BUILD_PUBLIC_TOKEN"
 
 [observability.logs]
 enabled = true
+
