@@ -14,7 +14,7 @@ crons = ["* * * * *"]
 # ==============================
 [vars]
 LOG_LEVEL = "info"
-MIN_EVENT_MAGNITUDE = "2"
+MIN_EVENT_MAGNITUDE = "4"
 MIN_INTENSITY_TO_SHOW = "3"
 ALERTA_TOP = "7"
 ALERTA_CANAL = "sms"
