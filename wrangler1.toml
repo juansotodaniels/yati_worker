@@ -1,0 +1,80 @@
+name = "yatiworker"
+main = "src/index.js"
+compatibility_date = "2024-12-01"
+workers_dev = true
+
+# ==============================
+# CRON (cada minuto)
+# ==============================
+[triggers]
+crons = ["* * * * *"]
+
+# ==============================
+# VARIABLES NORMALES (vars)
+# ==============================
+[vars]
+LOG_LEVEL = "info"
+MIN_EVENT_MAGNITUDE = "4"
+MIN_INTENSITY_TO_SHOW = "3"
+ALERTA_TOP = "7"
+ALERTA_CANAL = "sms"
+ENABLE_TEST_ALERT = "1"
+
+PUBLIC_REFRESH_FORCE_ON_EMPTY = "1"
+PUBLIC_REFRESH_MINUTES = "0"
+
+# URLs base
+RAILWAY_BASE_URL = "https://web-production-90ba9.up.railway.app"
+WORKER_PUBLIC_URL = "https://yatiworker.juansotodaniels.workers.dev"
+
+# XOR API
+XOR_API_URL = "https://api.xor.cl/sismo/recent"
+
+# ==============================
+# KV Namespace
+# ==============================
+[[kv_namespaces]]
+binding = "YATI_KV"
+id = "28fd8f5831ea4ce3afd26bdaaa29990b"
+preview_id = "28fd8f5831ea4ce3afd26bdaaa29990b"
+
+# ==============================
+# SECRET STORE BINDINGS
+# ==============================
+
+# Token para llamar a Railway /build-public
+[[secrets_store_secrets]]
+binding = "RAILWAY_BUILD_PUBLIC_TOKEN"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "RAILWAY_BUILD_PUBLIC_TOKEN"
+
+# Twilio
+[[secrets_store_secrets]]
+binding = "TWILIO_ACCOUNT_SID"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TWILIO_ACCOUNT_SID"
+
+[[secrets_store_secrets]]
+binding = "TWILIO_AUTH_TOKEN"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TWILIO_AUTH_TOKEN"
+
+[[secrets_store_secrets]]
+binding = "TWILIO_FROM_NUMBER"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TWILIO_FROM_NUMBER"
+
+# PIN para test-alert
+[[secrets_store_secrets]]
+binding = "TEST_ALERT_PIN"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TEST_ALERT_PIN"
+
+# Número por defecto para test-alert
+[[secrets_store_secrets]]
+binding = "TEST_ALERT_TO"
+store_id = "69df0156afc742099c6c0973ba8ce629"
+secret_name = "TEST_ALERT_TO"
+
+[observability.logs]
+enabled = true
