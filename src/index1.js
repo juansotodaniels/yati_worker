@@ -1,10 +1,19 @@
 // src/index.js — YATI Worker (Cloudflare Workers)
+//
 // - Cron: detecta sismo nuevo (XOR), consulta Railway /alerta/v1, filtra targets y envía por Twilio
 // - Guarda en KV:
 //    - last_seen_event_id, last_seen_mag, last_seen_at
 //    - last_alerted_event_id, last_alerted_payload_id, last_alerted_mag, last_alerted_at
 // - Endpoint manual: /test-alert (protegido por ENABLE_TEST_ALERT + PIN)
 // - Endpoint TwiML: /twiml (para llamadas, opcional)
+//
+// ✅ Self-healing HTML:
+//   - /public sirve HTML desde KV (public_html_v1)
+//   - Si KV está vacío: llama Railway /build-public (Bearer) y luego lee Railway /public para poblar KV
+//   - Antes de guardar el HTML en KV: reescribe URLs relativas (/static/...) a URL absoluta en Railway
+//
+// ✅ Proxy estáticos (fallback):
+//   - /static/* -> proxy hacia Railway, por si quedara algún asset relativo apuntando al Worker
 
 export default {
   async scheduled(event, env, ctx) {
@@ -14,9 +23,19 @@ export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
 
+    // ✅ Proxy estáticos (logo, mercalli, etc) hacia Railway
+    if (url.pathname.startsWith("/static/")) {
+      return proxyStaticFromRailway(request, env);
+    }
+
     // Health
     if (url.pathname === "/") {
       return new Response("YATI Worker activo");
+    }
+
+    // ✅ PUBLIC (sirve HTML desde KV; self-healing si falta)
+    if (url.pathname === "/public") {
+      return servePublicHtml(env, ctx, { reason: "public-hit" });
     }
 
     // 🔒 TEST ALERT (protegido por ENABLE_TEST_ALERT)
@@ -26,11 +45,13 @@ export default {
       }
 
       const pin = url.searchParams.get("pin") || "";
-      if (!env.TEST_ALERT_PIN || pin !== env.TEST_ALERT_PIN) {
+      const pinSecret = await getEnvValue(env, "TEST_ALERT_PIN");
+      if (!pinSecret || pin !== pinSecret) {
         return new Response("Unauthorized", { status: 401 });
       }
 
-      const to = url.searchParams.get("to") || env.TEST_ALERT_TO || "";
+      const defaultTo = await getEnvValue(env, "TEST_ALERT_TO");
+      const to = url.searchParams.get("to") || defaultTo || "";
       const customMsg = url.searchParams.get("msg") || "";
 
       ctx.waitUntil(testManualAlert(env, to, customMsg));
@@ -53,6 +74,30 @@ export default {
   }
 };
 
+/* ===============================
+   ✅ Proxy /static/* desde Railway
+================================= */
+async function proxyStaticFromRailway(request, env) {
+  const RAILWAY_BASE_URL = env.RAILWAY_BASE_URL;
+  if (!RAILWAY_BASE_URL) {
+    return new Response("Missing RAILWAY_BASE_URL", { status: 500 });
+  }
+
+  const url = new URL(request.url);
+  const target = `${RAILWAY_BASE_URL.replace(/\/$/, "")}${url.pathname}${url.search}`;
+
+  const r = await fetch(target, {
+    headers: { "User-Agent": "YATI-Worker/1.0" }
+  });
+
+  const headers = new Headers(r.headers);
+  if (!headers.has("Cache-Control")) {
+    headers.set("Cache-Control", "public, max-age=3600");
+  }
+
+  return new Response(r.body, { status: r.status, headers });
+}
+
 function escapeXml(s) {
   return String(s)
     .replaceAll("&", "&amp;")
@@ -62,11 +107,19 @@ function escapeXml(s) {
     .replaceAll("'", "&apos;");
 }
 
+function escapeHtml(s) {
+  return String(s || "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
 /* ===============================
-   LOG HELPER (más explícito)
+   LOG HELPER
 ================================= */
 function log(env, msg, extra) {
-  // LOG_LEVEL opcional: "debug" | "info" (default) | "silent"
   const lvl = String(env.LOG_LEVEL || "info").toLowerCase();
   if (lvl === "silent") return;
 
@@ -82,6 +135,194 @@ function log(env, msg, extra) {
 }
 
 /* ===============================
+   ✅ ENV/SECRETS HELPER
+   - Soporta:
+     1) vars/secrets clásicos (string en env.NAME)
+     2) Secrets Store bindings (env.NAME.get())
+================================= */
+async function getEnvValue(env, name) {
+  const v = env?.[name];
+  if (v == null) return "";
+  if (typeof v === "string") return v;
+  if (typeof v === "object" && typeof v.get === "function") {
+    try {
+      const got = await v.get();
+      return typeof got === "string" ? got : "";
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
+/* ===============================
+   PUBLIC HTML (KV) + SELF-HEALING
+================================= */
+
+async function servePublicHtml(env, ctx, { reason }) {
+  if (!env.YATI_KV) {
+    return new Response("KV not bound (YATI_KV)", { status: 500 });
+  }
+
+  const key = "public_html_v1";
+  const lastAtKey = "public_html_last_at";
+
+  let html = await env.YATI_KV.get(key);
+  const lastAt = await env.YATI_KV.get(lastAtKey);
+
+  // ✅ Si falta, disparar self-healing (no bloqueante)
+  const forceOnEmpty = String(env.PUBLIC_REFRESH_FORCE_ON_EMPTY || "1") === "1";
+  if ((!html || html.length < 200) && forceOnEmpty) {
+    log(env, "[YATI] KV sin public_html_v1 -> self-healing", { reason });
+
+    ctx.waitUntil(refreshPublicHtml(env, { reason: "self-heal-empty" }));
+
+    return new Response(buildPublicPlaceholder(env, lastAt, "Generando pagina..."), {
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      status: 200
+    });
+  }
+
+  // ✅ Refresco periódico opcional aunque exista HTML
+  const refreshMin = parseInt(env.PUBLIC_REFRESH_MINUTES || "0", 10);
+  if (refreshMin > 0 && shouldRefresh(lastAt, refreshMin)) {
+    ctx.waitUntil(refreshPublicHtml(env, { reason: "periodic-refresh" }));
+  }
+
+  if (!html) {
+    return new Response(buildPublicPlaceholder(env, lastAt, "Pagina aun no generada."), {
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      status: 200
+    });
+  }
+
+  return new Response(html, {
+    headers: {
+      "Content-Type": "text/html; charset=utf-8",
+      "Cache-Control": "public, max-age=20"
+    },
+    status: 200
+  });
+}
+
+function shouldRefresh(lastAtIso, minutes) {
+  if (!lastAtIso) return true;
+  const t = Date.parse(lastAtIso);
+  if (!Number.isFinite(t)) return true;
+  return (Date.now() - t) > minutes * 60 * 1000;
+}
+
+function buildPublicPlaceholder(env, lastAt, why) {
+  const workerUrl = env.WORKER_PUBLIC_URL || "";
+  const publicUrl = workerUrl ? `${workerUrl.replace(/\/$/, "")}/public` : "/public";
+  const last = lastAt ? lastAt : "No disponible";
+
+  return `<!doctype html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>YATI</title>
+</head>
+<body style="font-family:Arial,sans-serif; padding:18px; max-width:900px; margin:0 auto;">
+  <div style="padding:16px; border:1px solid #ddd; background:#fafafa; border-radius:12px;">
+    <div style="font-size:18px; font-weight:700;">${escapeHtml(why)}</div>
+    <div style="margin-top:10px; color:#555; font-size:13px;">
+      Ultima marca en KV: <b>${escapeHtml(last)}</b><br/>
+      Recarga en 15-30 segundos: <a href="${escapeHtml(publicUrl)}">${escapeHtml(publicUrl)}</a>
+    </div>
+  </div>
+</body>
+</html>`;
+}
+
+async function refreshPublicHtml(env, meta) {
+  const RAILWAY_BASE_URL = env.RAILWAY_BASE_URL;
+
+  // ✅ Soporta ambos nombres (por si uno quedó en Railway/Secrets Store)
+  const token =
+    (await getEnvValue(env, "RAILWAY_BUILD_PUBLIC_TOKEN")) ||
+    (await getEnvValue(env, "BUILD_PUBLIC_TOKEN"));
+
+  if (!env.YATI_KV) return log(env, "[YATI] refreshPublicHtml: falta KV");
+  if (!RAILWAY_BASE_URL) return log(env, "[YATI] refreshPublicHtml: falta RAILWAY_BASE_URL");
+  if (!token) return log(env, "[YATI] refreshPublicHtml: falta token (RAILWAY_BUILD_PUBLIC_TOKEN o BUILD_PUBLIC_TOKEN)");
+
+  const buildUrl = `${RAILWAY_BASE_URL.replace(/\/$/, "")}/build-public`;
+  log(env, "[YATI] Refresh public: llamando /build-public", { ...meta, buildUrl });
+
+  // 1) Disparar build en Railway (protegido)
+  const r = await fetch(buildUrl, {
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "User-Agent": "YATI-Worker/1.0"
+    }
+  });
+
+  const txt = await safeText(r);
+  if (!r.ok) {
+    log(env, "[YATI] /build-public no OK", { status: r.status, body: txt.slice(0, 250) });
+    return;
+  }
+
+  // 2) Leer HTML desde Railway /public (snapshot liviano)
+  const publicRailwayUrl = `${RAILWAY_BASE_URL.replace(/\/$/, "")}/public`;
+  const h = await fetch(publicRailwayUrl, { headers: { "User-Agent": "YATI-Worker/1.0" } });
+  let html = await safeText(h);
+
+  if (!h.ok || !html || html.length < 200) {
+    log(env, "[YATI] No pude leer HTML desde Railway /public", { status: h.status, bytes: html?.length || 0 });
+    return;
+  }
+
+  // ✅ CLAVE: convertir assets relativos a URL absoluta en Railway
+  html = absolutizeAssets(html, RAILWAY_BASE_URL);
+
+  await env.YATI_KV.put("public_html_v1", html);
+  await env.YATI_KV.put("public_html_last_at", new Date().toISOString());
+
+  log(env, "[YATI] Public HTML actualizado en KV", {
+    key: "public_html_v1",
+    bytes: html.length,
+    reason: meta?.reason || "unknown"
+  });
+}
+
+/**
+ * Convierte assets relativos a absolutos apuntando a Railway.
+ * Ejemplos que arregla:
+ *   src="/static/logo.png?v=1"  -> src="https://...railway.app/static/logo.png?v=1"
+ *   href="/static/x.css"        -> href="https://...railway.app/static/x.css"
+ *   src="static/logo.png"       -> src="https://...railway.app/static/logo.png"
+ *   href="static/x.css"         -> href="https://...railway.app/static/x.css"
+ *
+ * Además evita tocar URLs que YA sean absolutas (http://, https://, data:, etc).
+ */
+function absolutizeAssets(html, baseUrl) {
+  const base = String(baseUrl || "").replace(/\/$/, "");
+  if (!base) return html;
+
+  // Reemplazos específicos para /static (lo que te está fallando con el logo)
+  html = html.replaceAll('src="/static/', `src="${base}/static/`);
+  html = html.replaceAll("src='/static/", `src='${base}/static/`);
+  html = html.replaceAll('href="/static/', `href="${base}/static/`);
+  html = html.replaceAll("href='/static/", `href='${base}/static/`);
+
+  // Casos sin slash inicial: src="static/..."
+  html = html.replaceAll('src="static/', `src="${base}/static/`);
+  html = html.replaceAll("src='static/", `src='${base}/static/`);
+  html = html.replaceAll('href="static/', `href="${base}/static/`);
+  html = html.replaceAll("href='static/", `href='${base}/static/`);
+
+  // (Opcional) si tu HTML trae otras rutas raíz tipo "/assets/..."
+  // puedes descomentar estas líneas:
+  // html = html.replaceAll('src="/assets/', `src="${base}/assets/`);
+  // html = html.replaceAll('href="/assets/', `href="${base}/assets/`);
+
+  return html;
+}
+
+/* ===============================
    FLUJO AUTOMÁTICO (CRON)
 ================================= */
 
@@ -91,7 +332,9 @@ async function checkForNewEvent(env) {
 
   const MIN_EVENT_MAGNITUDE = parseFloat(env.MIN_EVENT_MAGNITUDE || "4");
   const MIN_INTENSITY_TO_SHOW = parseInt(env.MIN_INTENSITY_TO_SHOW || "3", 10);
-  const ALERTA_TOP = parseInt(env.ALERTA_TOP || "10", 10);
+
+  // ✅ default 7
+  const ALERTA_TOP = parseInt(env.ALERTA_TOP || "7", 10);
   const CANAL = (env.ALERTA_CANAL || "sms").toLowerCase(); // "sms" o "call"
 
   if (!RAILWAY_BASE_URL) {
@@ -156,7 +399,7 @@ async function checkForNewEvent(env) {
     await markSeen(env, latestId, M);
     log(env, "[YATI] Nuevo evento visto (last_seen actualizado)", { latestId, M, prevSeen });
   } else {
-    log(env, "[YATI] Último evento visto sin cambios", { latestId, M });
+    log(env, "[YATI] Ultimo evento visto sin cambios", { latestId, M });
   }
 
   // ✅ 3) last_alerted: evita repetir alertas del MISMO evento
@@ -173,6 +416,13 @@ async function checkForNewEvent(env) {
       M,
       minMagGlobal: MIN_EVENT_MAGNITUDE
     });
+
+    // ✅ Self-healing: si KV no tiene HTML, lo generamos igual
+    const html = await env.YATI_KV.get("public_html_v1");
+    if ((!html || html.length < 200) && String(env.PUBLIC_REFRESH_FORCE_ON_EMPTY || "1") === "1") {
+      await refreshPublicHtml(env, { reason: "self-heal-under-threshold", eventId: latestId, mag: String(M) });
+    }
+
     return;
   }
 
@@ -229,7 +479,10 @@ async function checkForNewEvent(env) {
   log(env, "[YATI] Targets cargados", { count: targets.length });
 
   if (!targets.length) {
-    log(env, "[YATI] No hay targets (alert_targets_v1 vacío). No envío.");
+    log(env, "[YATI] No hay targets (alert_targets_v1 vacio). No envio.");
+
+    // ✅ Igual refrescamos HTML publico para que se vea el evento
+    await refreshPublicHtml(env, { reason: "no-targets-refresh", eventId: latestId, mag: String(mag) });
     return;
   }
 
@@ -249,21 +502,22 @@ async function checkForNewEvent(env) {
   log(env, "[YATI] Targets seleccionados", { selected: selected.length, total: targets.length });
 
   if (!selected.length) {
-    // Marcamos alertado para no repetir cada minuto si no hay destinatarios aplicables
     await markAlerted(env, latestId, mag, payloadId);
     log(env, "[YATI] Sin targets aplicables: marco last_alerted para no repetir", { latestId, mag, payloadId });
+
+    // ✅ Igual refrescamos HTML publico
+    await refreshPublicHtml(env, { reason: "no-selected-refresh", eventId: latestId, mag: String(mag) });
     return;
   }
 
-  // --- 7) Mensaje ---
-  const message = buildMessage({
+  // --- 7) Mensaje (compacto + ASCII + corte seguro) ---
+  const message = buildMessageCompact(env, {
     evento,
     locs,
-    top: ALERTA_TOP,
-    minInt: MIN_INTENSITY_TO_SHOW
+    top: ALERTA_TOP
   });
 
-  // --- 8) Envío Twilio ---
+  // --- 8) Envio Twilio ---
   let okCount = 0;
   for (const t of selected) {
     const to = String(t.phone || "").trim();
@@ -286,6 +540,9 @@ async function checkForNewEvent(env) {
   if (okCount > 0) {
     await markAlerted(env, latestId, mag, payloadId);
     log(env, "[YATI] Alerta finalizada OK (last_alerted actualizado)", { okCount, latestId, mag, payloadId });
+
+    // ✅ Refresh público cuando se envió alerta
+    await refreshPublicHtml(env, { reason: "alert-sent", eventId: latestId, mag: String(mag) });
   } else {
     log(env, "[YATI] No se pudo enviar a nadie (okCount=0). No marco alertado.", { latestId, mag, payloadId });
   }
@@ -296,10 +553,14 @@ async function checkForNewEvent(env) {
 ================================= */
 
 async function testManualAlert(env, forceTo = "", customMsg = "") {
-  const msg =
+  const defaultMsg = "YATI TEST | 14-Feb 21:09 | Test manual | OK";
+  const msgRaw =
     (customMsg && customMsg.trim())
       ? customMsg.trim()
-      : "YATI - Sistema de Alerta de Intensidad Sismica. Prueba manual de envio SMS.";
+      : defaultMsg;
+
+  // ✅ ASCII + sin ¿¡!? + clamp
+  const msg = clampSmsAscii(env, toAscii(stripPunct(msgRaw)));
 
   const toFixed = (forceTo || "").trim();
 
@@ -341,32 +602,151 @@ async function loadTargets(env) {
   }
 }
 
-// Mensaje (incluye texto cuando no hay localidades sobre umbral)
-function buildMessage({ evento, locs, top, minInt }) {
-  const mag = evento?.magnitud ?? "";
-  const fecha = evento?.FechaHora ?? "";
-  const ref = evento?.Referencia ?? "";
+/* ===============================
+   MENSAJE COMPACTO (Trial-friendly)
+================================= */
 
-  const list = (locs || [])
-    .slice(0, Math.min(top, 6))
-    .map(x => `${x.localidad}(I=${x.intensidad_predicha})`)
+function buildMessageCompact(env, { evento, locs, top }) {
+  const M = safeNum(evento?.magnitud);
+  const magStr = Number.isFinite(M) ? M.toFixed(1) : String(evento?.magnitud ?? "").trim();
+
+  const dt = formatFechaHora(evento?.FechaHora);
+  const ref = compactRef(evento?.Referencia);
+
+  const maxLoc = Math.max(0, Math.min(parseInt(top || 0, 10) || 0, 7)) || 7;
+
+  const list = (Array.isArray(locs) ? locs : [])
+    .slice(0, maxLoc)
+    .map(x => {
+      const name = shortenName(String(x?.localidad || ""), 6);
+      const I = String(x?.intensidad_predicha ?? "").trim();
+      return `${name}(${I})`;
+    })
+    .filter(Boolean)
     .join(", ");
 
-  if (!list) {
-    return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. No hay localidades con intensidad estimada sobre el umbral ${minInt}.`;
+  let msg = `YATI M${magStr} | ${dt} | ${ref}`;
+  if (list) msg += ` | ${list}`;
+
+  msg = stripPunct(msg);
+  msg = toAscii(msg);
+  msg = clampSmsAscii(env, msg);
+
+  return msg;
+}
+
+function stripPunct(s) {
+  return String(s || "")
+    .replaceAll("¿", "")
+    .replaceAll("¡", "")
+    .replaceAll("?", "")
+    .replaceAll("!", "");
+}
+
+function safeNum(x) {
+  const n = parseFloat(String(x ?? "").replace(",", "."));
+  return Number.isFinite(n) ? n : NaN;
+}
+
+function formatFechaHora(fechaStr) {
+  const s = String(fechaStr || "").trim();
+  const m = s.match(/^(\d{2})-(\d{2})-(\d{4})\s+(\d{2}):(\d{2})(?::\d{2})?$/);
+  if (!m) return "NA";
+
+  const dd = m[1];
+  const mm = m[2];
+  const hh = m[4];
+  const mi = m[5];
+
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const idx = parseInt(mm, 10) - 1;
+  const mon = months[idx] || "NA";
+
+  return `${dd}-${mon} ${hh}:${mi}`;
+}
+
+function compactRef(ref) {
+  let s = String(ref || "NoRef").trim();
+  s = s.replaceAll("|", " ");
+  s = s.replace(/\s+/g, " ");
+
+  s = s
+    .replace(/\bal\s+/gi, " ")
+    .replace(/\bde\s+/gi, " ")
+    .replace(/\bdel\s+/gi, " ")
+    .replace(/\bkm\s+al\s+/gi, "km ")
+    .replace(/\bkm\s+a\s+/gi, "km ")
+    .replace(/\bNoreste\b/gi, "NE")
+    .replace(/\bNoroeste\b/gi, "NW")
+    .replace(/\bSureste\b/gi, "SE")
+    .replace(/\bSuroeste\b/gi, "SW");
+
+  s = s.replace(/\b(SE|SW|NE|NW)\s+de\s+/gi, "$1 ");
+
+  s = s.length > 32 ? (s.slice(0, 32).trim() + "...") : s;
+  return toAscii(stripPunct(s));
+}
+
+function shortenName(name, maxLen = 6) {
+  let s = toAscii(stripPunct(String(name || "").trim()));
+  s = s.replace(/[^A-Za-z0-9 ]/g, "");
+  s = s.replace(/\s+/g, " ").trim();
+
+  if (!s) return "";
+
+  const parts = s.split(" ").filter(Boolean);
+  if (parts.length >= 2) {
+    const first = parts[0];
+    const second = parts[1];
+    const candidate = (first.slice(0, Math.max(3, Math.min(4, first.length))) + second[0]).slice(0, maxLen);
+    return candidate;
   }
 
-  return `YATI - Sistema de Alerta de Intensidad Sismica. Magnitud ${mag}. Fecha y hora: ${fecha}. Referencia: ${ref}. Localidades con intensidad estimada: ${list}.`;
+  if (s.length <= maxLen) return s;
+  return s.slice(0, maxLen);
 }
+
+function toAscii(input) {
+  let s = String(input || "");
+  try {
+    s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  } catch {}
+  s = s.replaceAll("ñ", "n").replaceAll("Ñ", "N");
+  s = s.replace(/[“”]/g, '"').replace(/[‘’]/g, "'");
+  s = s.replace(/[–—]/g, "-");
+  return s;
+}
+
+function clampSmsAscii(env, body) {
+  const maxLen = parseInt(env.SMS_MAX_LEN || "155", 10);
+  let s = String(body || "");
+
+  s = s.replace(/\s+/g, " ").trim();
+  if (s.length <= maxLen) return s;
+
+  let cut = s.slice(0, maxLen);
+  const lastComma = cut.lastIndexOf(",");
+  const lastBar = cut.lastIndexOf("|");
+  const lastSpace = cut.lastIndexOf(" ");
+
+  const pivot = Math.max(lastComma, lastBar, lastSpace);
+  if (pivot > 40) cut = cut.slice(0, pivot).trim();
+
+  return cut;
+}
+
+/* ===============================
+   TWILIO (Secrets Store compatible)
+================================= */
 
 // Twilio SMS
 async function twilioSms(env, to, body) {
-  const sid = env.TWILIO_ACCOUNT_SID;
-  const token = env.TWILIO_AUTH_TOKEN;
-  const from = env.TWILIO_FROM_NUMBER;
+  const sid = await getEnvValue(env, "TWILIO_ACCOUNT_SID");
+  const token = await getEnvValue(env, "TWILIO_AUTH_TOKEN");
+  const from = await getEnvValue(env, "TWILIO_FROM_NUMBER");
 
   if (!sid || !token || !from) {
-    throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM).");
+    throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM). Revisa Secrets Store bindings.");
   }
 
   const url = `https://api.twilio.com/2010-04-01/Accounts/${sid}/Messages.json`;
@@ -396,9 +776,9 @@ async function twilioSms(env, to, body) {
 
 // Twilio Call (opcional futuro)
 async function twilioCall(env, to, text) {
-  const sid = env.TWILIO_ACCOUNT_SID;
-  const token = env.TWILIO_AUTH_TOKEN;
-  const from = env.TWILIO_FROM_NUMBER;
+  const sid = await getEnvValue(env, "TWILIO_ACCOUNT_SID");
+  const token = await getEnvValue(env, "TWILIO_AUTH_TOKEN");
+  const from = await getEnvValue(env, "TWILIO_FROM_NUMBER");
 
   if (!sid || !token || !from) throw new Error("Faltan credenciales Twilio (SID/TOKEN/FROM).");
   if (!env.WORKER_PUBLIC_URL) throw new Error("Falta env.WORKER_PUBLIC_URL (ej: https://tu-worker.workers.dev)");
@@ -426,16 +806,19 @@ async function twilioCall(env, to, text) {
 
   const txt = await safeText(r);
   if (!r.ok) throw new Error(`Twilio CALL no OK: ${r.status} ${txt?.slice(0, 300)}`);
+  return txt;
 }
 
-// ✅ last_seen: trazabilidad (aunque no alerte)
+/* ===============================
+   KV: last_seen / last_alerted
+================================= */
+
 async function markSeen(env, eventId, mag) {
   await env.YATI_KV.put("last_seen_event_id", String(eventId));
   await env.YATI_KV.put("last_seen_mag", String(mag));
   await env.YATI_KV.put("last_seen_at", new Date().toISOString());
 }
 
-// last_alerted: cuando decidimos “no repetir este evento”
 async function markAlerted(env, eventId, mag, payloadId) {
   await env.YATI_KV.put("last_alerted_event_id", String(eventId));
   await env.YATI_KV.put("last_alerted_payload_id", String(payloadId || eventId));
@@ -443,6 +826,9 @@ async function markAlerted(env, eventId, mag, payloadId) {
   await env.YATI_KV.put("last_alerted_at", new Date().toISOString());
 }
 
+/* ===============================
+   SAFE TEXT
+================================= */
 async function safeText(resp) {
   try { return await resp.text(); } catch { return ""; }
 }
